@@ -63,7 +63,7 @@ func TestChatResponseFromOpenAIRoundTrip(t *testing.T) {
 	src := &OpenAIChatResponse{
 		ID:      "chat-1",
 		Model:   "gpt-test",
-		Choices: []OpenAIChoice{{Index: 0, Message: OpenAIMessage{Role: "assistant", Content: "Hello there."}, FinishReason: "stop"}},
+		Choices: []OpenAIChoice{{Index: 0, Message: OpenAIChoiceMsg{Role: "assistant", Content: "Hello there."}, FinishReason: "stop"}},
 		Usage:   &OpenAIUsage{PromptTokens: 5, CompletionTokens: 3, TotalTokens: 8},
 	}
 	out := ChatResponseFromOpenAI(src)

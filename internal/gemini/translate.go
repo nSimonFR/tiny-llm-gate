@@ -16,12 +16,36 @@ type OpenAIChatRequest struct {
 	TopP        *float64         `json:"top_p,omitempty"`
 	MaxTokens   *int             `json:"max_tokens,omitempty"`
 	Stop        []string         `json:"stop,omitempty"`
+	Tools       []OpenAITool     `json:"tools,omitempty"`
+}
+
+// OpenAITool is a function-calling tool definition.
+type OpenAITool struct {
+	Type     string         `json:"type"`
+	Function OpenAIFunction `json:"function"`
+}
+
+// OpenAIFunction describes a callable function in OpenAI format.
+type OpenAIFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 // OpenAIMessage is a single message.
 type OpenAIMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+}
+
+// OpenAIToolCall is a tool invocation in a response.
+type OpenAIToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 // OpenAIChatResponse is the non-streaming response shape.
@@ -36,10 +60,16 @@ type OpenAIChatResponse struct {
 
 // OpenAIChoice is one of the Choices in a chat response.
 type OpenAIChoice struct {
-	Index        int                    `json:"index"`
-	Message      OpenAIMessage          `json:"message"`
-	FinishReason string                 `json:"finish_reason,omitempty"`
-	Delta        map[string]any         `json:"delta,omitempty"`
+	Index        int              `json:"index"`
+	Message      OpenAIChoiceMsg  `json:"message"`
+	FinishReason string           `json:"finish_reason,omitempty"`
+}
+
+// OpenAIChoiceMsg extends OpenAIMessage with tool_calls for responses.
+type OpenAIChoiceMsg struct {
+	Role      string           `json:"role"`
+	Content   string           `json:"content"`
+	ToolCalls []OpenAIToolCall  `json:"tool_calls,omitempty"`
 }
 
 // OpenAIUsage mirrors the usage object we care about.
@@ -85,8 +115,9 @@ type OpenAIStreamChoice struct {
 
 // OpenAIDelta is a streaming token delta.
 type OpenAIDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string           `json:"role,omitempty"`
+	Content   string           `json:"content,omitempty"`
+	ToolCalls []OpenAIToolCall  `json:"tool_calls,omitempty"`
 }
 
 // ChatRequestToOpenAI converts a Gemini chat request into the OpenAI wire
@@ -124,6 +155,19 @@ func ChatRequestToOpenAI(in *ChatRequest, model string, stream bool) (*OpenAICha
 		out.MaxTokens = cfg.MaxOutputTokens
 		out.Stop = cfg.StopSequences
 	}
+	// Forward tool (function calling) definitions.
+	for _, t := range in.Tools {
+		for _, fd := range t.FunctionDeclarations {
+			out.Tools = append(out.Tools, OpenAITool{
+				Type: "function",
+				Function: OpenAIFunction{
+					Name:        fd.Name,
+					Description: fd.Description,
+					Parameters:  fd.Parameters,
+				},
+			})
+		}
+	}
 	return out, nil
 }
 
@@ -132,11 +176,15 @@ func ChatRequestToOpenAI(in *ChatRequest, model string, stream bool) (*OpenAICha
 func ChatResponseFromOpenAI(resp *OpenAIChatResponse) *ChatResponse {
 	out := &ChatResponse{Candidates: make([]Candidate, 0, len(resp.Choices))}
 	for _, ch := range resp.Choices {
+		parts := toolCallsToParts(ch.Message.ToolCalls)
+		if ch.Message.Content != "" {
+			parts = append([]Part{{Text: ch.Message.Content}}, parts...)
+		}
 		out.Candidates = append(out.Candidates, Candidate{
 			Index: ch.Index,
 			Content: Content{
 				Role:  "model",
-				Parts: []Part{{Text: ch.Message.Content}},
+				Parts: parts,
 			},
 			FinishReason: mapFinishReasonToGemini(ch.FinishReason),
 		})
@@ -167,7 +215,11 @@ func StreamChunkFromOpenAI(raw []byte) (*ChatResponse, error) {
 	for _, ch := range chunk.Choices {
 		content := Content{Role: "model"}
 		if ch.Delta.Content != "" {
-			content.Parts = []Part{{Text: ch.Delta.Content}}
+			content.Parts = append(content.Parts, Part{Text: ch.Delta.Content})
+			hasContent = true
+		}
+		if tcParts := toolCallsToParts(ch.Delta.ToolCalls); len(tcParts) > 0 {
+			content.Parts = append(content.Parts, tcParts...)
 			hasContent = true
 		}
 		out.Candidates = append(out.Candidates, Candidate{
@@ -251,6 +303,26 @@ func BatchEmbedResponseFromOpenAI(resp *OpenAIEmbedResponse) *BatchEmbedContents
 	return &BatchEmbedContentsResponse{Embeddings: embeddings}
 }
 
+// toolCallsToParts converts OpenAI tool_calls into Gemini FunctionCall parts.
+func toolCallsToParts(calls []OpenAIToolCall) []Part {
+	if len(calls) == 0 {
+		return nil
+	}
+	parts := make([]Part, 0, len(calls))
+	for _, tc := range calls {
+		if tc.Function.Name == "" {
+			continue
+		}
+		parts = append(parts, Part{
+			FunctionCall: &FunctionCall{
+				Name: tc.Function.Name,
+				Args: json.RawMessage(tc.Function.Arguments),
+			},
+		})
+	}
+	return parts
+}
+
 func joinParts(parts []Part) string {
 	if len(parts) == 0 {
 		return ""
@@ -290,6 +362,8 @@ func mapRoleToOpenAI(role string) string {
 func mapFinishReasonToGemini(r string) string {
 	switch strings.ToLower(r) {
 	case "stop":
+		return "STOP"
+	case "tool_calls":
 		return "STOP"
 	case "length":
 		return "MAX_TOKENS"

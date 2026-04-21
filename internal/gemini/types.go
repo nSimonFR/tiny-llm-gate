@@ -7,11 +7,26 @@
 // them when a real client needs them.
 package gemini
 
+import "encoding/json"
+
 // ChatRequest is the body of POST /v1beta/models/{model}:generateContent.
 type ChatRequest struct {
 	Contents          []Content          `json:"contents,omitempty"`
 	SystemInstruction *Content           `json:"systemInstruction,omitempty"`
 	GenerationConfig  *GenerationConfig  `json:"generationConfig,omitempty"`
+	Tools             []Tool             `json:"tools,omitempty"`
+}
+
+// Tool wraps a list of function declarations (Gemini format).
+type Tool struct {
+	FunctionDeclarations []FunctionDeclaration `json:"functionDeclarations,omitempty"`
+}
+
+// FunctionDeclaration describes a callable function.
+type FunctionDeclaration struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 // Content is a single turn in the conversation.
@@ -21,9 +36,16 @@ type Content struct {
 	Parts []Part `json:"parts"`
 }
 
-// Part is one chunk of a message. We keep only the text field.
+// Part is one chunk of a message.
 type Part struct {
-	Text string `json:"text,omitempty"`
+	Text         string        `json:"text,omitempty"`
+	FunctionCall *FunctionCall `json:"functionCall,omitempty"`
+}
+
+// FunctionCall is emitted by the model when it wants to invoke a tool.
+type FunctionCall struct {
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args,omitempty"`
 }
 
 // GenerationConfig is the subset of sampling parameters we translate.
