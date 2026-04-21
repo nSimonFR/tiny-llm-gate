@@ -59,6 +59,12 @@ type Model struct {
 	Provider      string   `yaml:"provider"`
 	UpstreamModel string   `yaml:"upstream_model"`
 	Fallback      []string `yaml:"fallback,omitempty"`
+	// DefaultEmbedDimensions, when set, is injected into embedding requests
+	// that arrive without an explicit dimension parameter (Gemini
+	// outputDimensionality / OpenAI dimensions). Prevents Matryoshka-capable
+	// models from returning their full native dimension when the client
+	// SDK omits the field.
+	DefaultEmbedDimensions *int `yaml:"default_embed_dimensions,omitempty"`
 }
 
 // Load reads and validates a YAML config file.

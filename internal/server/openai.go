@@ -89,6 +89,11 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, upstreamPat
 			lastErr = err
 			continue
 		}
+		// Inject default embed dimensions for embedding requests when the
+		// client didn't supply them.
+		if upstreamPath == embedPath && hop.DefaultEmbedDimensions != nil {
+			newBody = injectDefaultDimensions(newBody, *hop.DefaultEmbedDimensions)
+		}
 		done, err := s.sendUpstream(w, r, hop, upstreamPath, newBody, peek.Stream, i < len(chain)-1)
 		if done {
 			s.logger.Info("served",
@@ -298,6 +303,26 @@ func rewriteModelField(body []byte, newModel string) ([]byte, error) {
 		return nil, errors.New("no 'model' field to rewrite")
 	}
 	return out.Bytes(), nil
+}
+
+// injectDefaultDimensions adds "dimensions" to an OpenAI embedding request
+// body only when the field is absent. Returns the original body unchanged
+// when it already contains a "dimensions" key.
+func injectDefaultDimensions(body []byte, dims int) []byte {
+	var peek map[string]json.RawMessage
+	if json.Unmarshal(body, &peek) != nil {
+		return body
+	}
+	if _, ok := peek["dimensions"]; ok {
+		return body // client already set it
+	}
+	dimBytes, _ := json.Marshal(dims)
+	peek["dimensions"] = dimBytes
+	out, err := json.Marshal(peek)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func trimTrailingNewline(b *bytes.Buffer) {

@@ -234,6 +234,9 @@ func (s *Server) handleEmbedContent(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if oaReq.Dimensions == nil && res.DefaultEmbedDimensions != nil {
+		oaReq.Dimensions = res.DefaultEmbedDimensions
+	}
 
 	oaResp, err := s.sendGeminiEmbedRequest(r, res, oaReq)
 	if err != nil {
@@ -278,6 +281,9 @@ func (s *Server) handleBatchEmbedContents(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if oaReq.Dimensions == nil && res.DefaultEmbedDimensions != nil {
+		oaReq.Dimensions = res.DefaultEmbedDimensions
 	}
 
 	oaResp, err := s.sendGeminiEmbedRequest(r, res, oaReq)

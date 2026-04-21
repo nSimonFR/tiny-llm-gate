@@ -425,6 +425,37 @@ func TestOAuthChatGPTBackendAppliesBearer(t *testing.T) {
 	}
 }
 
+func TestInjectDefaultDimensions(t *testing.T) {
+	// Without dimensions — should inject.
+	body := []byte(`{"model":"emb","input":["hello"]}`)
+	got := injectDefaultDimensions(body, 1024)
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal(got, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	var dims int
+	if err := json.Unmarshal(parsed["dimensions"], &dims); err != nil {
+		t.Fatal(err)
+	}
+	if dims != 1024 {
+		t.Errorf("expected 1024, got %d", dims)
+	}
+
+	// With dimensions already set — should not override.
+	body2 := []byte(`{"model":"emb","input":["hello"],"dimensions":512}`)
+	got2 := injectDefaultDimensions(body2, 1024)
+	var parsed2 map[string]json.RawMessage
+	if err := json.Unmarshal(got2, &parsed2); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(parsed2["dimensions"], &dims); err != nil {
+		t.Fatal(err)
+	}
+	if dims != 512 {
+		t.Errorf("expected 512 (original), got %d", dims)
+	}
+}
+
 func makeTestJWT(expOffsetSec int64) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
 	body := base64.RawURLEncoding.EncodeToString(

@@ -31,6 +31,9 @@ type Resolved struct {
 	// The chain is a list of canonical model names; each must still be
 	// re-resolved to pick up its own provider/upstream_model.
 	Fallback []string
+	// DefaultEmbedDimensions, when set, is the default dimension to inject
+	// into embedding requests that don't specify one.
+	DefaultEmbedDimensions *int
 }
 
 // Resolve looks up a model by the name a client provided. Alias chains are
@@ -59,11 +62,12 @@ func (r *Resolver) Resolve(name string) (*Resolved, error) {
 		return nil, fmt.Errorf("model %q references unknown provider %q", current, m.Provider)
 	}
 	return &Resolved{
-		ModelName:     current,
-		UpstreamModel: m.UpstreamModel,
-		ProviderName:  m.Provider,
-		Provider:      p,
-		Fallback:      m.Fallback,
+		ModelName:              current,
+		UpstreamModel:          m.UpstreamModel,
+		ProviderName:           m.Provider,
+		Provider:               p,
+		Fallback:               m.Fallback,
+		DefaultEmbedDimensions: m.DefaultEmbedDimensions,
 	}, nil
 }
 
