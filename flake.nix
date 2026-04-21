@@ -20,7 +20,7 @@
           pname = "tiny-llm-gate";
           inherit version;
           src = ./.;
-          vendorHash = null;
+          vendorHash = "sha256-g+yaVIx4jxpAQ/+WrGKxhVeliYx7nLQe/zsGpxV4Fn4=";
 
           ldflags = [
             "-s"
@@ -28,8 +28,8 @@
             "-X main.Version=${version}"
           ];
 
-          # Keep the binary small and fast to start.
-          CGO_ENABLED = 0;
+          # Keep the binary small and statically linked.
+          env.CGO_ENABLED = "0";
 
           meta = with pkgs.lib; {
             description = "Memory-conscious OpenAI-compatible LLM gateway";

@@ -1,32 +1,187 @@
 # tiny-llm-gate
 
-A tight, memory-conscious OpenAI-compatible LLM gateway.
+A memory-conscious, OpenAI-compatible LLM gateway.
 
-## Goals
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-- **Tiny footprint**: target ≤ 12 MB RSS idle, ≤ 25 MB under load.
-- **Drop-in OpenAI API**: `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`.
-- **Pluggable frontends & backends**: add Gemini/Anthropic protocols without touching the core.
-- **Fallback chains**: transparent, server-side — clients don't know about them.
-- **No framework, no runtime deps** beyond `net/http` stdlib + `gopkg.in/yaml.v3`.
+## Why
 
-## Non-goals
+If you self-host LLMs (Ollama, llama.cpp) on a small box and want a single endpoint that:
 
-- Cost tracking in USD (bring your own observability).
-- Prometheus metrics (use structured logs + Telegram alerting).
-- Rate limiting / multi-tenant billing (this is a single-user gateway).
-- Tokenizer-heavy features (would bloat the binary).
+- speaks the OpenAI API,
+- rewrites client-facing model names to real upstream models,
+- falls back transparently from one upstream to another on failure,
+- streams responses token-by-token,
+
+…your main option today is [LiteLLM](https://github.com/BerriAI/litellm). It's great, but it's a full Python stack (~65 MB RSS + sizeable dependency tree). On a Raspberry Pi 5 with 4 GB of RAM that's a meaningful chunk of the memory budget.
+
+**tiny-llm-gate** is a single Go binary doing the same job in **under 10 MB of RSS**.
 
 ## Status
 
-Phase 1: OpenAI in / OpenAI out. Non-streaming + streaming. Aliases, fallbacks.
+**v0.1.0 — Phase 1**: OpenAI in / OpenAI out, streaming, aliases, fallbacks.
 
-See `ROADMAP.md` for planned phases.
+See [ROADMAP.md](ROADMAP.md) for the path to feature parity with the LiteLLM setup it's replacing (codex OAuth backend, Gemini frontend, SIGHUP hot-reload).
 
-## Config
+## Quick start
 
-See `testdata/example-config.yaml`.
+```bash
+cat > config.yaml <<'YAML'
+listen: 127.0.0.1:4001
+
+providers:
+  ollama:
+    type: openai
+    base_url: http://192.168.1.10:11434/v1
+    api_key: ollama
+
+models:
+  "gemma3:4b":
+    provider: ollama
+    upstream_model: gemma3:4b
+
+aliases:
+  "gpt-4o-mini": "gemma3:4b"
+YAML
+
+go run ./cmd/tiny-llm-gate --config config.yaml
+```
+
+Now point any OpenAI SDK at `http://127.0.0.1:4001/v1` and request `model: "gpt-4o-mini"` — it'll hit your Ollama instance as `gemma3:4b`.
+
+## Config reference
+
+```yaml
+listen: 127.0.0.1:4001      # host:port (default 127.0.0.1:4001)
+
+providers:                  # upstream LLM endpoints
+  <name>:
+    type: openai            # only "openai" today
+    base_url: <url>         # e.g. http://host:11434/v1
+    api_key: <string>       # Bearer token; omit for unauthenticated upstreams
+
+models:                     # canonical model names
+  <name>:
+    provider: <provider>
+    upstream_model: <id>    # model id actually sent to provider
+    fallback:               # optional: try these models on 5xx upstream errors
+      - <name>
+      - <name>
+
+aliases:                    # client-facing model name → canonical model
+  <alias>: <model>          # chains are supported (cycle-detected)
+
+drop_params: true           # reserved for future use
+```
+
+See [`testdata/example-config.yaml`](testdata/example-config.yaml) for a fuller example.
+
+## Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST   | `/v1/chat/completions` | OpenAI chat, streaming + non-streaming |
+| POST   | `/v1/embeddings`       | OpenAI embeddings |
+| GET    | `/v1/models`           | list all model names + aliases |
+| GET    | `/health`              | liveness |
+| GET    | `/ready`               | readiness (config loaded) |
+
+## Memory discipline
+
+| | |
+|-|-|
+| Binary size | **6.5 MiB** stripped |
+| RSS idle    | **6.9 MiB** measured |
+| Runtime deps | `gopkg.in/yaml.v3` only |
+| HTTP client | stdlib `net/http`, bounded idle pool, HTTP/2 disabled for predictable streaming |
+| Request body cap | 8 MiB |
+| GOMEMLIMIT (recommended) | `20MiB` |
+| MemoryMax (systemd, recommended) | `30M` |
+
+The CI (TODO) fails PRs whose RSS regresses past these targets.
+
+## Running on NixOS
+
+Use the flake input directly:
+
+```nix
+# flake.nix
+{
+  inputs.tiny-llm-gate.url = "github:nSimonFR/tiny-llm-gate";
+
+  outputs = { nixpkgs, tiny-llm-gate, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        tiny-llm-gate.nixosModules.default
+        {
+          services.tiny-llm-gate = {
+            enable = true;
+            package = tiny-llm-gate.packages.aarch64-linux.default;
+            settings = {
+              listen = "127.0.0.1:4001";
+              providers.ollama = {
+                type = "openai";
+                base_url = "http://192.168.1.10:11434/v1";
+                api_key = "ollama";
+              };
+              models."gemma3:4b" = {
+                provider = "ollama";
+                upstream_model = "gemma3:4b";
+              };
+              aliases."gpt-4o-mini" = "gemma3:4b";
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+The systemd unit applies sandboxing (`DynamicUser`, `ProtectSystem=strict`, …) and sets `GOMEMLIMIT=20MiB` and `MemoryMax=30M` by default. Both are tunable via the module options.
+
+## Comparison
+
+| | tiny-llm-gate | LiteLLM | [Bifrost](https://github.com/maximhq/bifrost) | [one-api](https://github.com/songquanpeng/one-api) |
+|---|---|---|---|---|
+| Runtime | Go | Python | Go | Go + React |
+| RSS idle | ~7 MiB | ~65 MiB | ~25 MiB | ~60 MiB |
+| YAML config | ✅ | ✅ | partial | DB-backed |
+| Server-side fallbacks | ✅ | ✅ | per-request | ✅ |
+| Model aliases | ✅ (unified) | ✅ (two kinds) | per-key | via UI |
+| Streaming (SSE) | ✅ | ✅ | ✅ | ✅ |
+| Gemini-format frontend | roadmap | ✅ | partial | ❌ |
+| OAuth backend | roadmap | ✅ | ❌ | ❌ |
+
+## Non-goals
+
+- Cost tracking in USD
+- Prometheus `/metrics`
+- Multi-tenant billing / quotas
+- Request rate limiting
+- Tokenizer-based features (counting, truncation)
+
+Bring your own observability. Structured JSON logs are on stderr.
+
+## Extensibility
+
+Frontends and backends are the two extension points. Adding, say, Anthropic's `/v1/messages` frontend or an Anthropic-native backend is a single package implementing a small interface — no changes to the router.
+
+This is enforced in the tree layout:
+
+```
+internal/
+├── config/       # YAML + validation
+├── resolve/      # model name → provider decision
+└── server/       # HTTP wiring + frontend + backend (monolithic today)
+```
+
+Once Phase 3/4 land, the server package will split into `frontends/` and `backends/`.
 
 ## License
 
-MIT (once pushed publicly).
+MIT (see [LICENSE](LICENSE) once added).
+
+## Contributing
+
+Early days — issues and discussions welcome at https://github.com/nSimonFR/tiny-llm-gate/issues.
