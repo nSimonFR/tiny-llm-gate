@@ -40,6 +40,7 @@ type OpenAIMessage struct {
 
 // OpenAIToolCall is a tool invocation in a response.
 type OpenAIToolCall struct {
+	Index    int    `json:"index"`
 	ID       string `json:"id"`
 	Type     string `json:"type"`
 	Function struct {
@@ -199,9 +200,169 @@ func ChatResponseFromOpenAI(resp *OpenAIChatResponse) *ChatResponse {
 	return out
 }
 
+// ToolCallAccumulator buffers incremental OpenAI streaming tool-call deltas
+// and produces complete Gemini FunctionCall parts once finished.
+//
+// OpenAI streams tool calls incrementally: the first chunk carries the id,
+// type, and function name with empty arguments; subsequent chunks carry
+// argument fragments (with no name). Gemini expects complete function calls
+// in a single chunk, so we must buffer until finish_reason signals completion.
+type ToolCallAccumulator struct {
+	// pending maps tool-call index → accumulated state.
+	pending map[int]*pendingToolCall
+}
+
+type pendingToolCall struct {
+	Name string
+	Args []byte // accumulated argument fragments
+}
+
+// Add merges a streaming tool-call delta into the accumulator.
+func (a *ToolCallAccumulator) Add(tc OpenAIToolCall) {
+	if a.pending == nil {
+		a.pending = make(map[int]*pendingToolCall)
+	}
+	idx := tc.Index
+	p, ok := a.pending[idx]
+	if !ok {
+		p = &pendingToolCall{}
+		a.pending[idx] = p
+	}
+	if tc.Function.Name != "" {
+		p.Name = tc.Function.Name
+	}
+	if tc.Function.Arguments != "" {
+		p.Args = append(p.Args, tc.Function.Arguments...)
+	}
+}
+
+// Flush returns complete Gemini FunctionCall parts for all buffered tool
+// calls and resets the accumulator.
+func (a *ToolCallAccumulator) Flush() []Part {
+	if len(a.pending) == 0 {
+		return nil
+	}
+	parts := make([]Part, 0, len(a.pending))
+	for _, p := range a.pending {
+		if p.Name == "" {
+			continue
+		}
+		part := Part{
+			FunctionCall: &FunctionCall{
+				Name: p.Name,
+			},
+		}
+		if len(p.Args) > 0 {
+			part.FunctionCall.Args = json.RawMessage(p.Args)
+		}
+		parts = append(parts, part)
+	}
+	a.pending = nil
+	return parts
+}
+
+// HasPending reports whether any tool calls are being accumulated.
+func (a *ToolCallAccumulator) HasPending() bool {
+	return len(a.pending) > 0
+}
+
+// StreamChunkResult holds the parsed result of a single OpenAI SSE chunk,
+// split into text content and tool-call deltas so the caller can handle
+// buffering of incremental tool calls.
+type StreamChunkResult struct {
+	// TextResponse is non-nil when the chunk carries text content or a
+	// finish reason (without tool calls). Ready to send immediately.
+	TextResponse *ChatResponse
+	// ToolCallDeltas are incremental tool-call fragments to feed into a
+	// ToolCallAccumulator.
+	ToolCallDeltas []OpenAIToolCall
+	// FinishReason is set when the chunk carries a finish reason, signalling
+	// that any buffered tool calls should be flushed.
+	FinishReason string
+	// Usage, if present.
+	Usage *OpenAIUsage
+}
+
+// ParseStreamChunk parses a single OpenAI SSE chunk and separates text
+// content from tool-call deltas. The caller is responsible for buffering
+// tool-call deltas via ToolCallAccumulator and flushing on FinishReason.
+func ParseStreamChunk(raw []byte) (*StreamChunkResult, error) {
+	var chunk OpenAIStreamChunk
+	if err := json.Unmarshal(raw, &chunk); err != nil {
+		return nil, fmt.Errorf("parse openai chunk: %w", err)
+	}
+	if len(chunk.Choices) == 0 {
+		return nil, nil
+	}
+
+	result := &StreamChunkResult{Usage: chunk.Usage}
+	hasText := false
+
+	out := &ChatResponse{Candidates: make([]Candidate, 0, len(chunk.Choices))}
+
+	for _, ch := range chunk.Choices {
+		if ch.FinishReason != "" {
+			result.FinishReason = ch.FinishReason
+		}
+		// Collect tool-call deltas separately.
+		for _, tc := range ch.Delta.ToolCalls {
+			result.ToolCallDeltas = append(result.ToolCallDeltas, tc)
+		}
+		// Build text-only candidate.
+		content := Content{Role: "model"}
+		if ch.Delta.Content != "" {
+			content.Parts = append(content.Parts, Part{Text: ch.Delta.Content})
+			hasText = true
+		}
+		out.Candidates = append(out.Candidates, Candidate{
+			Index:   ch.Index,
+			Content: content,
+			// FinishReason is handled below when flushing tool calls.
+		})
+	}
+
+	if hasText {
+		if chunk.Usage != nil {
+			out.UsageMetadata = &UsageMetadata{
+				PromptTokenCount:     chunk.Usage.PromptTokens,
+				CandidatesTokenCount: chunk.Usage.CompletionTokens,
+				TotalTokenCount:      chunk.Usage.TotalTokens,
+			}
+		}
+		result.TextResponse = out
+	}
+
+	return result, nil
+}
+
+// BuildToolCallResponse constructs a Gemini ChatResponse containing the
+// flushed FunctionCall parts. Called when finish_reason signals completion.
+func BuildToolCallResponse(parts []Part, finishReason string, usage *OpenAIUsage) *ChatResponse {
+	if len(parts) == 0 {
+		return nil
+	}
+	out := &ChatResponse{
+		Candidates: []Candidate{{
+			Content: Content{
+				Role:  "model",
+				Parts: parts,
+			},
+			FinishReason: mapFinishReasonToGemini(finishReason),
+		}},
+	}
+	if usage != nil {
+		out.UsageMetadata = &UsageMetadata{
+			PromptTokenCount:     usage.PromptTokens,
+			CandidatesTokenCount: usage.CompletionTokens,
+			TotalTokenCount:      usage.TotalTokens,
+		}
+	}
+	return out
+}
+
 // StreamChunkFromOpenAI converts a single OpenAI SSE chunk to the Gemini
-// streaming JSON shape that Gemini emits (one JSON object per line, no
-// `data:` prefix). Returns nil if the chunk carries no deltable content.
+// streaming JSON shape. This is the simple path for chunks that carry no
+// tool calls. For tool-call-aware streaming, use ParseStreamChunk instead.
 func StreamChunkFromOpenAI(raw []byte) (*ChatResponse, error) {
 	var chunk OpenAIStreamChunk
 	if err := json.Unmarshal(raw, &chunk); err != nil {

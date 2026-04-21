@@ -155,6 +155,11 @@ func (s *Server) writeGeminiNonStream(w http.ResponseWriter, resp *http.Response
 
 // writeGeminiStream pipes OpenAI SSE chunks into Gemini's newline-delimited
 // JSON streaming format. Each emitted line is one JSON ChatResponse chunk.
+//
+// OpenAI streams tool calls incrementally (name in first chunk, argument
+// fragments in subsequent chunks). Gemini expects complete FunctionCall
+// objects. We buffer tool-call deltas and flush them as a single chunk once
+// the upstream signals completion via finish_reason.
 func (s *Server) writeGeminiStream(w http.ResponseWriter, r *http.Request, resp *http.Response) {
 	defer resp.Body.Close()
 
@@ -171,6 +176,30 @@ func (s *Server) writeGeminiStream(w http.ResponseWriter, r *http.Request, resp 
 	flusher, _ := w.(http.Flusher)
 
 	reader := bufio.NewReaderSize(resp.Body, 4096)
+	var tcAccum gemini.ToolCallAccumulator
+
+	emit := func(chunk *gemini.ChatResponse) bool {
+		if chunk == nil {
+			return true
+		}
+		chunkJSON, jerr := json.Marshal(chunk)
+		if jerr != nil {
+			return true
+		}
+		if useSSE {
+			if _, werr := fmt.Fprintf(w, "data: %s\r\n\r\n", chunkJSON); werr != nil {
+				return false
+			}
+		} else {
+			if _, werr := fmt.Fprintf(w, "%s\n", chunkJSON); werr != nil {
+				return false
+			}
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return true
+	}
 
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -185,30 +214,44 @@ func (s *Server) writeGeminiStream(w http.ResponseWriter, r *http.Request, resp 
 			}
 			payload := bytes.TrimSpace(line[len("data:"):])
 			if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+				// Stream ended — flush any remaining buffered tool calls.
+				if tcAccum.HasPending() {
+					if !emit(gemini.BuildToolCallResponse(tcAccum.Flush(), "stop", nil)) {
+						return
+					}
+				}
 				continue
 			}
-			chunk, cerr := gemini.StreamChunkFromOpenAI(payload)
-			if cerr != nil || chunk == nil {
+
+			result, cerr := gemini.ParseStreamChunk(payload)
+			if cerr != nil || result == nil {
 				continue
 			}
-			chunkJSON, jerr := json.Marshal(chunk)
-			if jerr != nil {
-				continue
+
+			// Buffer tool-call deltas.
+			for _, tc := range result.ToolCallDeltas {
+				tcAccum.Add(tc)
 			}
-			if useSSE {
-				if _, werr := fmt.Fprintf(w, "data: %s\r\n\r\n", chunkJSON); werr != nil {
+
+			// Emit text content immediately.
+			if result.TextResponse != nil {
+				if !emit(result.TextResponse) {
 					return
 				}
-			} else {
-				if _, werr := fmt.Fprintf(w, "%s\n", chunkJSON); werr != nil {
+			}
+
+			// On finish_reason, flush buffered tool calls.
+			if result.FinishReason != "" && tcAccum.HasPending() {
+				if !emit(gemini.BuildToolCallResponse(tcAccum.Flush(), result.FinishReason, result.Usage)) {
 					return
 				}
-			}
-			if flusher != nil {
-				flusher.Flush()
 			}
 		}
 		if err != nil {
+			// EOF — flush any remaining buffered tool calls.
+			if tcAccum.HasPending() {
+				emit(gemini.BuildToolCallResponse(tcAccum.Flush(), "stop", nil))
+			}
 			return
 		}
 	}
