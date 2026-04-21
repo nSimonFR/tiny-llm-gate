@@ -85,7 +85,7 @@ func (s *Server) serveGeminiChat(w http.ResponseWriter, r *http.Request, stream 
 		}
 
 		if stream {
-			s.writeGeminiStream(w, resp)
+			s.writeGeminiStream(w, r, resp)
 		} else {
 			s.writeGeminiNonStream(w, resp)
 		}
@@ -155,22 +155,22 @@ func (s *Server) writeGeminiNonStream(w http.ResponseWriter, resp *http.Response
 
 // writeGeminiStream pipes OpenAI SSE chunks into Gemini's newline-delimited
 // JSON streaming format. Each emitted line is one JSON ChatResponse chunk.
-func (s *Server) writeGeminiStream(w http.ResponseWriter, resp *http.Response) {
+func (s *Server) writeGeminiStream(w http.ResponseWriter, r *http.Request, resp *http.Response) {
 	defer resp.Body.Close()
 
-	// Gemini's streamGenerateContent responds with application/json and
-	// sends JSON objects separated by commas inside a top-level array — but
-	// the commonly-used google-genai libraries accept newline-delimited
-	// JSON too, which is what the npm `@google/genai` uses via text/plain.
-	// We use newline-delimited JSON here (Content-Type: application/json)
-	// because it is simpler to produce token-by-token and widely consumed.
-	w.Header().Set("Content-Type", "application/json")
+	// The Vercel @ai-sdk/google SDK sends ?alt=sse and expects Server-Sent
+	// Events (data: {...}\n\n). Other clients (e.g. @google/genai) use
+	// newline-delimited JSON. We detect from the query parameter.
+	useSSE := r.URL.Query().Get("alt") == "sse"
+	if useSSE {
+		w.Header().Set("Content-Type", "text/event-stream")
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 
 	reader := bufio.NewReaderSize(resp.Body, 4096)
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
 
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -191,8 +191,18 @@ func (s *Server) writeGeminiStream(w http.ResponseWriter, resp *http.Response) {
 			if cerr != nil || chunk == nil {
 				continue
 			}
-			if werr := enc.Encode(chunk); werr != nil {
-				return
+			chunkJSON, jerr := json.Marshal(chunk)
+			if jerr != nil {
+				continue
+			}
+			if useSSE {
+				if _, werr := fmt.Fprintf(w, "data: %s\r\n\r\n", chunkJSON); werr != nil {
+					return
+				}
+			} else {
+				if _, werr := fmt.Fprintf(w, "%s\n", chunkJSON); werr != nil {
+					return
+				}
 			}
 			if flusher != nil {
 				flusher.Flush()
