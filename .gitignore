@@ -1,0 +1,6 @@
+/tiny-llm-gate
+/result
+/result-*
+*.out
+.direnv/
+.envrc

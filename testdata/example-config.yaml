@@ -1,0 +1,92 @@
+# tiny-llm-gate example configuration
+#
+# Replicates the LiteLLM config used by nic-os:
+#   - Ollama on beast (OpenAI-compatible)
+#   - Codex proxy on localhost (OpenAI-compatible)
+#   - Aliases for AFFiNE/OpenWebUI/PicoClaw client model names
+#   - Transparent fallback from gpt-5.4 → local gemma4
+
+listen: 127.0.0.1:4001
+
+providers:
+  ollama:
+    type: openai
+    base_url: http://100.125.240.34:11434/v1
+    api_key: ollama
+
+  codex:
+    type: openai
+    base_url: http://127.0.0.1:4040/v1
+    api_key: unused
+
+models:
+  "gemma4:e4b":
+    provider: ollama
+    upstream_model: gemma4:e4b
+
+  "gemma4:26b":
+    provider: ollama
+    upstream_model: gemma4:26b
+
+  "qwen3.5:35b-a3b":
+    provider: ollama
+    upstream_model: qwen3.5:35b-a3b
+
+  "qwen3-embedding:8b":
+    provider: ollama
+    upstream_model: qwen3-embedding:8b
+
+  "gpt-5.4":
+    provider: codex
+    upstream_model: gpt-5.4
+    fallback: ["gemma4:e4b"]
+
+  "gpt-5.4-mini":
+    provider: codex
+    upstream_model: gpt-5.4-mini
+    fallback: ["gemma4:e4b"]
+
+  "gpt-5.2":
+    provider: codex
+    upstream_model: gpt-5.2
+
+  "gpt-5.3-codex":
+    provider: codex
+    upstream_model: gpt-5.3-codex
+
+  "codex-auto-review":
+    provider: codex
+    upstream_model: codex-auto-review
+
+aliases:
+  # Strip "openai/" prefix (PicoClaw removes it before requesting)
+  "openai/gemma4:e4b":       "gemma4:e4b"
+  "openai/gemma4:26b":       "gemma4:26b"
+  "openai/qwen3.5:35b-a3b":  "qwen3.5:35b-a3b"
+  "openai/qwen3-embedding:8b": "qwen3-embedding:8b"
+  "openai/gpt-5.4":          "gpt-5.4"
+  "openai/gpt-5.4-mini":     "gpt-5.4-mini"
+  "openai/gpt-5.2":          "gpt-5.2"
+  "openai/gpt-5.3-codex":    "gpt-5.3-codex"
+  "openai/codex-auto-review": "codex-auto-review"
+
+  # AFFiNE hardcodes GPT model names for OpenAI provider
+  "gpt-4.1-2025-04-14":    "gemma4:e4b"
+  "gpt-4.1-mini":          "gemma4:e4b"
+  "gpt-4o":                "gemma4:e4b"
+  "gpt-4o-mini":           "gemma4:e4b"
+
+  # AFFiNE hardcodes OpenAI embedding models
+  "text-embedding-3-small": "qwen3-embedding:8b"
+  "text-embedding-3-large": "qwen3-embedding:8b"
+
+  # AFFiNE Gemini provider model names (routed through Gemini front-end
+  # once phase 4 ships; meanwhile resolvable via OpenAI front-end too)
+  "gemini-2.5-flash":       "gemma4:e4b"
+  "gemini-2.5-pro":         "gemma4:e4b"
+  "gemini-2.0-flash":       "gemma4:e4b"
+  "gemini-2.0-flash-001":   "gemma4:e4b"
+  "gemini-embedding-001":   "qwen3-embedding:8b"
+  "text-embedding-004":     "qwen3-embedding:8b"
+
+drop_params: true
