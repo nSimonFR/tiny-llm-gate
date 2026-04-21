@@ -40,7 +40,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	s := server.New(cfg, logger)
+	s, err := server.New(cfg, logger)
+	if err != nil {
+		logger.Error("init server", "err", err)
+		os.Exit(1)
+	}
 	httpServer := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           s.Handler(),

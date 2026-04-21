@@ -25,8 +25,33 @@ type Provider struct {
 	Type string `yaml:"type"`
 	// BaseURL is the upstream root (e.g. "http://host:port/v1").
 	BaseURL string `yaml:"base_url"`
-	// APIKey is used as a bearer token when non-empty.
+	// APIKey is a shorthand for `auth: { type: bearer, token: <value> }`.
+	// Kept for backwards compatibility with simple configs. Do not set when
+	// `auth` is present — validation rejects the combination.
 	APIKey string `yaml:"api_key"`
+	// Auth describes how to authenticate upstream requests. Optional: when
+	// absent and APIKey is empty, requests are sent unauthenticated.
+	Auth *Auth `yaml:"auth,omitempty"`
+}
+
+// Auth is the upstream authentication strategy.
+type Auth struct {
+	// Type is one of: "bearer", "oauth_chatgpt".
+	Type string `yaml:"type"`
+
+	// -- bearer --
+	Token string `yaml:"token,omitempty"`
+
+	// -- oauth_chatgpt: ChatGPT/Codex OAuth token file with auto-refresh --
+	// File is the path to the JSON file containing {tokens: {access_token,
+	// refresh_token, id_token}, last_refresh}. Matches the layout used by
+	// `openai-oauth` (github.com/EvanZhouDev/openai-oauth).
+	File string `yaml:"file,omitempty"`
+	// Issuer is the OAuth issuer root. Defaults to https://auth.openai.com.
+	Issuer string `yaml:"issuer,omitempty"`
+	// ClientID is passed to the refresh endpoint. Defaults to the published
+	// ChatGPT Codex client id.
+	ClientID string `yaml:"client_id,omitempty"`
 }
 
 // Model binds a canonical model name to a provider and an upstream model id.
@@ -76,6 +101,14 @@ func (c *Config) validate() error {
 		if p.BaseURL == "" {
 			return fmt.Errorf("provider %q: base_url is required", name)
 		}
+		if p.APIKey != "" && p.Auth != nil {
+			return fmt.Errorf("provider %q: use either api_key or auth, not both", name)
+		}
+		if p.Auth != nil {
+			if err := validateAuth(name, p.Auth); err != nil {
+				return err
+			}
+		}
 	}
 	if len(c.Models) == 0 {
 		return errors.New("no models defined")
@@ -111,3 +144,31 @@ func (c *Config) validate() error {
 	return nil
 }
 
+func validateAuth(providerName string, a *Auth) error {
+	switch a.Type {
+	case "bearer":
+		if a.Token == "" {
+			return fmt.Errorf("provider %q: auth.type=bearer requires auth.token", providerName)
+		}
+	case "oauth_chatgpt":
+		if a.File == "" {
+			return fmt.Errorf("provider %q: auth.type=oauth_chatgpt requires auth.file", providerName)
+		}
+	default:
+		return fmt.Errorf("provider %q: unknown auth.type %q (supported: bearer, oauth_chatgpt)", providerName, a.Type)
+	}
+	return nil
+}
+
+// EffectiveAuth returns the authentication strategy for a provider, folding
+// the legacy APIKey field into a bearer Auth. Returns nil when no auth is
+// configured (unauthenticated upstream).
+func (p Provider) EffectiveAuth() *Auth {
+	if p.Auth != nil {
+		return p.Auth
+	}
+	if p.APIKey != "" {
+		return &Auth{Type: "bearer", Token: p.APIKey}
+	}
+	return nil
+}

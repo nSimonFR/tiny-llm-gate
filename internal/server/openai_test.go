@@ -2,11 +2,15 @@ package server
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -74,7 +78,11 @@ func buildServer(t *testing.T, providers map[string]config.Provider, models map[
 		Models:    models,
 		Aliases:   aliases,
 	}
-	return New(cfg, discardLogger())
+	s, err := New(cfg, discardLogger())
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	return s
 }
 
 func postJSON(t *testing.T, h http.Handler, path string, body map[string]any) *httptest.ResponseRecorder {
@@ -359,4 +367,68 @@ func TestRewriteModelFieldInvalidJSON(t *testing.T) {
 	if _, err := rewriteModelField([]byte(`not json`), "new"); err == nil {
 		t.Error("expected error for invalid JSON")
 	}
+}
+
+func TestOAuthChatGPTBackendAppliesBearer(t *testing.T) {
+	newAccess := makeTestJWT(3600)
+
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"` + newAccess + `","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer issuer.Close()
+
+	upstream := newMockUpstream(200, `{"id":"x","choices":[{"message":{"content":"hi"}}]}`)
+	defer upstream.Close()
+
+	authFile := filepath.Join(t.TempDir(), "auth.json")
+	authContent := `{
+  "tokens": {"access_token":"` + makeTestJWT(-120) + `","refresh_token":"rt"},
+  "last_refresh": "2020-01-01T00:00:00Z"
+}`
+	if err := os.WriteFile(authFile, []byte(authContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Providers: map[string]config.Provider{
+			"codex": {
+				Type:    "openai",
+				BaseURL: upstream.URL + "/v1",
+				Auth: &config.Auth{
+					Type:     "oauth_chatgpt",
+					File:     authFile,
+					Issuer:   issuer.URL,
+					ClientID: "test",
+				},
+			},
+		},
+		Models: map[string]config.Model{
+			"gpt-5": {Provider: "codex", UpstreamModel: "gpt-5"},
+		},
+	}
+	s, err := New(cfg, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	rec := postJSON(t, s.Handler(), "/v1/chat/completions", map[string]any{
+		"model":    "gpt-5",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 200 {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	got := upstream.mu.headers[0].Get("Authorization")
+	if got != "Bearer "+newAccess {
+		t.Errorf("upstream Authorization = %q; expected Bearer %s", got, newAccess)
+	}
+}
+
+func makeTestJWT(expOffsetSec int64) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	body := base64.RawURLEncoding.EncodeToString(
+		[]byte(`{"exp":` + strconv.FormatInt(time.Now().Unix()+expOffsetSec, 10) + `}`),
+	)
+	return header + "." + body + ".sig"
 }

@@ -4,11 +4,13 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"time"
 
+	"github.com/nSimonFR/tiny-llm-gate/internal/auth"
 	"github.com/nSimonFR/tiny-llm-gate/internal/config"
 	"github.com/nSimonFR/tiny-llm-gate/internal/resolve"
 )
@@ -19,11 +21,13 @@ type Server struct {
 	resolver *resolve.Resolver
 	client   *http.Client
 	logger   *slog.Logger
+	// auths is a per-provider Authenticator, built once at startup.
+	auths map[string]auth.Authenticator
 }
 
 // New builds a Server. The *http.Client has generous timeouts for streaming
 // LLM responses but tight idle-connection limits to keep memory bounded.
-func New(cfg *config.Config, logger *slog.Logger) *Server {
+func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	transport := &http.Transport{
 		// Bounded pool keeps FD + memory tight.
 		MaxIdleConns:          16,
@@ -40,6 +44,10 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 	}
+	auths, err := buildAuthenticators(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
 		cfg:      cfg,
 		resolver: resolve.New(cfg),
@@ -47,7 +55,34 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 		// for minutes. Per-phase timeouts live on the Transport.
 		client: &http.Client{Transport: transport},
 		logger: logger,
+		auths:  auths,
+	}, nil
+}
+
+// buildAuthenticators constructs one auth.Authenticator per provider based on
+// config. Providers without authentication get no entry — sendUpstream treats
+// missing as "send without auth header".
+func buildAuthenticators(cfg *config.Config) (map[string]auth.Authenticator, error) {
+	out := make(map[string]auth.Authenticator, len(cfg.Providers))
+	for name, p := range cfg.Providers {
+		a := p.EffectiveAuth()
+		if a == nil {
+			continue
+		}
+		switch a.Type {
+		case "bearer":
+			out[name] = auth.Bearer{Token: a.Token}
+		case "oauth_chatgpt":
+			oa, err := auth.NewChatGPTOAuth(a.File, a.Issuer, a.ClientID)
+			if err != nil {
+				return nil, fmt.Errorf("provider %q oauth: %w", name, err)
+			}
+			out[name] = oa
+		default:
+			return nil, fmt.Errorf("provider %q: unsupported auth type %q", name, a.Type)
+		}
 	}
+	return out, nil
 }
 
 // Handler returns the HTTP handler for this server.

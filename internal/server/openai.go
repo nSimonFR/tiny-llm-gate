@@ -128,6 +128,9 @@ func (s *Server) sendUpstream(
 	isStream bool,
 	canRetry bool,
 ) (done bool, err error) {
+	// Internal upstreamPath is always the "/chat/completions" or
+	// "/embeddings" suffix. Providers set base_url accordingly — OpenAI-compat
+	// servers include the /v1, Codex-style roots don't.
 	url := strings.TrimRight(hop.Provider.BaseURL, "/") + upstreamPath
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(body))
@@ -135,8 +138,10 @@ func (s *Server) sendUpstream(
 		return false, fmt.Errorf("build upstream request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if hop.Provider.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+hop.Provider.APIKey)
+	if authz, ok := s.auths[hop.ProviderName]; ok {
+		if err := authz.Apply(r.Context(), req); err != nil {
+			return false, fmt.Errorf("auth: %w", err)
+		}
 	}
 
 	resp, err := s.client.Do(req)

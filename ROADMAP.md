@@ -2,10 +2,10 @@
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 0     | Repo skeleton, Go module, flake, NixOS module | in progress |
-| 1     | OpenAI frontend + OpenAI backend (API key) + aliases + fallbacks + streaming | in progress |
-| 2     | Validated streaming end-to-end against OpenWebUI + PicoClaw | |
-| 3     | `openai-codex-oauth` backend absorbs `openai-codex-proxy` (OAuth token + refresh) | |
+| 0     | Repo skeleton, Go module, flake, NixOS module | ✅ done (v0.1.0) |
+| 1     | OpenAI frontend + OpenAI backend (API key) + aliases + fallbacks + streaming | ✅ done (v0.1.1) |
+| 2     | Validated streaming end-to-end against real OpenAI-compat upstream (codex-proxy) | ✅ done |
+| 3     | `oauth_chatgpt` auth absorbs `openai-codex-proxy` (OAuth token load + JWT expiry check + refresh + atomic persist) | ✅ done (v0.2.0) |
 | 4     | Gemini frontend absorbs `affine-embed-proxy` (`generateContent`, `streamGenerateContent`, `embedContent`, `batchEmbedContents`) | |
 | 5     | Cutover: delete LiteLLM + codex-proxy + embed-proxy from nic-os flake | |
 | 6     | Tier-1 generic features: SIGHUP hot-reload, structured logs, retries w/ backoff, circuit breakers, graceful shutdown | |

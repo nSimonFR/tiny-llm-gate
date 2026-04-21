@@ -64,6 +64,69 @@ models:
 	}
 }
 
+func TestParseAuthBearer(t *testing.T) {
+	c, err := Parse([]byte(`
+providers:
+  p:
+    type: openai
+    base_url: http://x/v1
+    auth:
+      type: bearer
+      token: abc
+models:
+  m: { provider: p, upstream_model: m }
+`))
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	a := c.Providers["p"].EffectiveAuth()
+	if a == nil || a.Type != "bearer" || a.Token != "abc" {
+		t.Errorf("effective auth = %+v", a)
+	}
+}
+
+func TestParseAuthOAuthChatGPT(t *testing.T) {
+	c, err := Parse([]byte(`
+providers:
+  p:
+    type: openai
+    base_url: http://x
+    auth:
+      type: oauth_chatgpt
+      file: /tmp/auth.json
+      issuer: https://auth.example
+      client_id: app_x
+models:
+  m: { provider: p, upstream_model: m }
+`))
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	a := c.Providers["p"].EffectiveAuth()
+	if a == nil || a.Type != "oauth_chatgpt" {
+		t.Fatalf("effective auth = %+v", a)
+	}
+	if a.File != "/tmp/auth.json" || a.Issuer != "https://auth.example" || a.ClientID != "app_x" {
+		t.Errorf("oauth fields not parsed: %+v", a)
+	}
+}
+
+func TestApiKeyBecomesBearer(t *testing.T) {
+	c, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x, api_key: hunter2 }
+models:
+  m: { provider: p, upstream_model: m }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := c.Providers["p"].EffectiveAuth()
+	if a == nil || a.Type != "bearer" || a.Token != "hunter2" {
+		t.Errorf("api_key did not fold into bearer: %+v", a)
+	}
+}
+
 func TestParseRejectsInvalid(t *testing.T) {
 	cases := map[string]string{
 		"no providers": `
@@ -124,6 +187,43 @@ providers:
 models:
   m: { provider: p, upstream_model: m }
 bogus_top_level: 1
+`,
+		"both api_key and auth": `
+providers:
+  p:
+    type: openai
+    base_url: http://x
+    api_key: k
+    auth: { type: bearer, token: k }
+models:
+  m: { provider: p, upstream_model: m }
+`,
+		"unknown auth type": `
+providers:
+  p:
+    type: openai
+    base_url: http://x
+    auth: { type: magic }
+models:
+  m: { provider: p, upstream_model: m }
+`,
+		"bearer auth missing token": `
+providers:
+  p:
+    type: openai
+    base_url: http://x
+    auth: { type: bearer }
+models:
+  m: { provider: p, upstream_model: m }
+`,
+		"oauth missing file": `
+providers:
+  p:
+    type: openai
+    base_url: http://x
+    auth: { type: oauth_chatgpt }
+models:
+  m: { provider: p, upstream_model: m }
 `,
 	}
 	for name, cfg := range cases {
