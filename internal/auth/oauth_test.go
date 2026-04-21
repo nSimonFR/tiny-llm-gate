@@ -101,6 +101,9 @@ func TestChatGPTSetsAccountIDHeader(t *testing.T) {
 	if got := req.Header.Get("Authorization"); got != "Bearer "+access {
 		t.Errorf("Authorization header missing or wrong: %q", got)
 	}
+	if got := req.Header.Get("OpenAI-Beta"); got != "responses=experimental" {
+		t.Errorf("OpenAI-Beta header missing or wrong: %q", got)
+	}
 }
 
 func TestChatGPTOmitsAccountIDWhenMissing(t *testing.T) {

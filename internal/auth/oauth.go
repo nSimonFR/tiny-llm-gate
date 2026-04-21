@@ -105,6 +105,10 @@ func (c *ChatGPTOAuth) Apply(ctx context.Context, req *http.Request) error {
 	if acct != "" {
 		req.Header.Set("chatgpt-account-id", acct)
 	}
+	// The Codex backend gates access on this experimental-responses beta
+	// flag; openai-oauth sets it unconditionally. Without it, even a valid
+	// token + account_id get a 403 HTML login page.
+	req.Header.Set("OpenAI-Beta", "responses=experimental")
 	return nil
 }
 
