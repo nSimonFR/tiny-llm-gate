@@ -94,11 +94,51 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/embeddings", s.handleEmbeddings)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 
+	// Gemini frontend. The Gemini URL form is /v1beta/models/{model}:action
+	// where `:action` is a suffix on the final path segment, not a separator
+	// Go's ServeMux handles natively. We route by prefix and dispatch on the
+	// action in a single handler.
+	mux.HandleFunc("POST /v1beta/models/", s.routeGemini)
+
 	// Health and readiness
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /ready", s.handleReady)
 
 	return withRequestID(mux)
+}
+
+// routeGemini dispatches /v1beta/models/{model}:action to the right handler.
+// Splitting on the last colon gives us the action suffix.
+func (s *Server) routeGemini(w http.ResponseWriter, r *http.Request) {
+	// Find last ':' in the path — the action separator Gemini uses.
+	path := r.URL.Path
+	colon := -1
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == ':' {
+			colon = i
+			break
+		}
+		if path[i] == '/' {
+			break
+		}
+	}
+	if colon < 0 {
+		writeJSONError(w, http.StatusNotFound, "expected /v1beta/models/{model}:action")
+		return
+	}
+	action := path[colon+1:]
+	switch action {
+	case "generateContent":
+		s.handleGenerateContent(w, r)
+	case "streamGenerateContent":
+		s.handleStreamGenerateContent(w, r)
+	case "embedContent":
+		s.handleEmbedContent(w, r)
+	case "batchEmbedContents":
+		s.handleBatchEmbedContents(w, r)
+	default:
+		writeJSONError(w, http.StatusNotFound, "unknown Gemini action: "+action)
+	}
 }
 
 // Shutdown gracefully closes idle upstream connections.

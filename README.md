@@ -19,9 +19,9 @@ If you self-host LLMs (Ollama, llama.cpp) on a small box and want a single endpo
 
 ## Status
 
-**v0.1.0 — Phase 1**: OpenAI in / OpenAI out, streaming, aliases, fallbacks.
+**v0.3.0**: OpenAI & Gemini frontends, OpenAI backend with optional ChatGPT OAuth auth, streaming, aliases, fallbacks.
 
-See [ROADMAP.md](ROADMAP.md) for the path to feature parity with the LiteLLM setup it's replacing (codex OAuth backend, Gemini frontend, SIGHUP hot-reload).
+See [ROADMAP.md](ROADMAP.md) for remaining phases (production cutover, SIGHUP hot-reload).
 
 ## Quick start
 
@@ -83,8 +83,14 @@ See [`testdata/example-config.yaml`](testdata/example-config.yaml) for a fuller 
 | POST   | `/v1/chat/completions` | OpenAI chat, streaming + non-streaming |
 | POST   | `/v1/embeddings`       | OpenAI embeddings |
 | GET    | `/v1/models`           | list all model names + aliases |
+| POST   | `/v1beta/models/{m}:generateContent`       | Gemini chat, non-streaming |
+| POST   | `/v1beta/models/{m}:streamGenerateContent` | Gemini chat, streaming (newline-delimited JSON) |
+| POST   | `/v1beta/models/{m}:embedContent`          | Gemini single-item embedding |
+| POST   | `/v1beta/models/{m}:batchEmbedContents`    | Gemini batch embedding |
 | GET    | `/health`              | liveness |
 | GET    | `/ready`               | readiness (config loaded) |
+
+Gemini requests are transparently translated to OpenAI format before being forwarded to the upstream — you can point an AFFiNE Gemini provider at this gateway and route to an Ollama backend.
 
 ## Memory discipline
 
