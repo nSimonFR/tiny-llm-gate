@@ -314,14 +314,23 @@ func ParseStreamChunk(raw []byte) (*StreamChunkResult, error) {
 			content.Parts = append(content.Parts, Part{Text: ch.Delta.Content})
 			hasText = true
 		}
-		out.Candidates = append(out.Candidates, Candidate{
+		candidate := Candidate{
 			Index:   ch.Index,
 			Content: content,
-			// FinishReason is handled below when flushing tool calls.
-		})
+		}
+		// Attach finish reason to text/empty candidates. For tool-call
+		// streams the finish reason is applied when flushing the accumulator.
+		if len(ch.Delta.ToolCalls) == 0 {
+			candidate.FinishReason = mapFinishReasonToGemini(ch.FinishReason)
+		}
+		out.Candidates = append(out.Candidates, candidate)
 	}
 
-	if hasText {
+	// Emit TextResponse when there's text OR a finish reason (without
+	// pending tool calls). The finish-reason-only chunk signals stream
+	// completion — dropping it causes the client to hang.
+	hasFinish := result.FinishReason != "" && len(result.ToolCallDeltas) == 0
+	if hasText || hasFinish {
 		if chunk.Usage != nil {
 			out.UsageMetadata = &UsageMetadata{
 				PromptTokenCount:     chunk.Usage.PromptTokens,
