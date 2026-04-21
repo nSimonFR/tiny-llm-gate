@@ -42,6 +42,12 @@ in
       default = "20MiB";
       description = "GOMEMLIMIT env — the Go runtime's soft memory target.";
     };
+
+    secretPaths = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Extra paths to grant read access to (e.g. agenix secrets). Added to systemd ReadOnlyPaths.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -63,6 +69,9 @@ in
 
         # Hard memory ceiling — OOMs if we regress.
         MemoryMax = cfg.memoryMax;
+
+        # Grant access to secret files (e.g. agenix tokens for MCP bridges).
+        ReadOnlyPaths = cfg.secretPaths;
 
         # Sandboxing.
         DynamicUser = true;

@@ -225,6 +225,51 @@ providers:
 models:
   m: { provider: p, upstream_model: m }
 `,
+		"mcp_bridge bad frontend": `
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+mcp_bridges:
+  b: { frontend: websocket, backend: streamable_http, upstream_url: http://x, path_prefix: /mcp }
+`,
+		"mcp_bridge bad backend": `
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+mcp_bridges:
+  b: { frontend: sse, backend: stdio, upstream_url: http://x, path_prefix: /mcp }
+`,
+		"mcp_bridge missing upstream_url": `
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+mcp_bridges:
+  b: { frontend: sse, backend: streamable_http, path_prefix: /mcp }
+`,
+		"mcp_bridge missing path_prefix slash": `
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+mcp_bridges:
+  b: { frontend: sse, backend: streamable_http, upstream_url: http://x, path_prefix: mcp }
+`,
+		"mcp_bridge bearer both token and token_file": `
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+mcp_bridges:
+  b:
+    frontend: sse
+    backend: streamable_http
+    upstream_url: http://x
+    path_prefix: /mcp
+    auth: { type: bearer, token: abc, token_file: /tmp/t }
+`,
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -232,5 +277,71 @@ models:
 				t.Errorf("expected error for %q, got nil", name)
 			}
 		})
+	}
+}
+
+func TestParseMCPBridgeValid(t *testing.T) {
+	c, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+mcp_bridges:
+  affine:
+    frontend: sse
+    backend: streamable_http
+    upstream_url: http://127.0.0.1:13010/mcp
+    path_prefix: /mcp/affine
+    auth:
+      type: bearer
+      token: secret123
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(c.MCPBridges) != 1 {
+		t.Fatalf("expected 1 MCP bridge, got %d", len(c.MCPBridges))
+	}
+	b := c.MCPBridges["affine"]
+	if b.Frontend != "sse" || b.Backend != "streamable_http" {
+		t.Errorf("bridge types: frontend=%q backend=%q", b.Frontend, b.Backend)
+	}
+	if b.UpstreamURL != "http://127.0.0.1:13010/mcp" {
+		t.Errorf("upstream_url = %q", b.UpstreamURL)
+	}
+	if b.PathPrefix != "/mcp/affine" {
+		t.Errorf("path_prefix = %q", b.PathPrefix)
+	}
+	if b.Auth == nil || b.Auth.Token != "secret123" {
+		t.Errorf("auth = %+v", b.Auth)
+	}
+}
+
+func TestParseMCPBridgeTokenFile(t *testing.T) {
+	_, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+mcp_bridges:
+  b:
+    frontend: sse
+    backend: streamable_http
+    upstream_url: http://x
+    path_prefix: /mcp/b
+    auth:
+      type: bearer
+      token_file: /run/agenix/token
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParseMCPBridgeNoBridges(t *testing.T) {
+	// Config without mcp_bridges should still be valid.
+	_, err := Parse([]byte(validConfig))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

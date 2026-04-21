@@ -12,11 +12,28 @@ import (
 
 // Config is the root configuration.
 type Config struct {
-	Listen     string              `yaml:"listen"`
-	Providers  map[string]Provider `yaml:"providers"`
-	Models     map[string]Model    `yaml:"models"`
-	Aliases    map[string]string   `yaml:"aliases"`
-	DropParams bool                `yaml:"drop_params"`
+	Listen     string                `yaml:"listen"`
+	Providers  map[string]Provider   `yaml:"providers"`
+	Models     map[string]Model      `yaml:"models"`
+	Aliases    map[string]string     `yaml:"aliases"`
+	DropParams bool                  `yaml:"drop_params"`
+	MCPBridges map[string]MCPBridge  `yaml:"mcp_bridges,omitempty"`
+}
+
+// MCPBridge configures an MCP protocol transport bridge. It accepts
+// connections using one MCP transport (frontend) and forwards JSON-RPC
+// messages to an upstream MCP server using another transport (backend).
+type MCPBridge struct {
+	// Frontend is the transport exposed to clients. Supported: "sse".
+	Frontend string `yaml:"frontend"`
+	// Backend is the transport used to reach the upstream. Supported: "streamable_http".
+	Backend string `yaml:"backend"`
+	// UpstreamURL is the upstream MCP endpoint.
+	UpstreamURL string `yaml:"upstream_url"`
+	// PathPrefix is the URL prefix for this bridge's routes (e.g. "/mcp/affine").
+	PathPrefix string `yaml:"path_prefix"`
+	// Auth configures authentication for the upstream connection. Optional.
+	Auth *Auth `yaml:"auth,omitempty"`
 }
 
 // Provider describes one upstream LLM endpoint.
@@ -41,6 +58,10 @@ type Auth struct {
 
 	// -- bearer --
 	Token string `yaml:"token,omitempty"`
+	// TokenFile is a path to a file containing the bearer token. The file
+	// is read once at startup. Alternative to Token for secret management
+	// systems (e.g. agenix) that write tokens to files.
+	TokenFile string `yaml:"token_file,omitempty"`
 
 	// -- oauth_chatgpt: ChatGPT/Codex OAuth token file with auto-refresh --
 	// File is the path to the JSON file containing {tokens: {access_token,
@@ -147,14 +168,51 @@ func (c *Config) validate() error {
 			return fmt.Errorf("alias %q: target %q is not a model or alias", alias, target)
 		}
 	}
+	if err := c.validateMCPBridges(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) validateMCPBridges() error {
+	if len(c.MCPBridges) == 0 {
+		return nil
+	}
+	seen := make(map[string]string) // path_prefix → bridge name
+	for name, b := range c.MCPBridges {
+		if b.Frontend != "sse" {
+			return fmt.Errorf("mcp_bridge %q: unsupported frontend %q (supported: sse)", name, b.Frontend)
+		}
+		if b.Backend != "streamable_http" {
+			return fmt.Errorf("mcp_bridge %q: unsupported backend %q (supported: streamable_http)", name, b.Backend)
+		}
+		if b.UpstreamURL == "" {
+			return fmt.Errorf("mcp_bridge %q: upstream_url is required", name)
+		}
+		if b.PathPrefix == "" || b.PathPrefix[0] != '/' {
+			return fmt.Errorf("mcp_bridge %q: path_prefix must start with /", name)
+		}
+		if other, dup := seen[b.PathPrefix]; dup {
+			return fmt.Errorf("mcp_bridge %q: path_prefix %q conflicts with bridge %q", name, b.PathPrefix, other)
+		}
+		seen[b.PathPrefix] = name
+		if b.Auth != nil {
+			if err := validateAuth("mcp_bridge "+name, b.Auth); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
 func validateAuth(providerName string, a *Auth) error {
 	switch a.Type {
 	case "bearer":
-		if a.Token == "" {
-			return fmt.Errorf("provider %q: auth.type=bearer requires auth.token", providerName)
+		if a.Token == "" && a.TokenFile == "" {
+			return fmt.Errorf("provider %q: auth.type=bearer requires auth.token or auth.token_file", providerName)
+		}
+		if a.Token != "" && a.TokenFile != "" {
+			return fmt.Errorf("provider %q: use either auth.token or auth.token_file, not both", providerName)
 		}
 	case "oauth_chatgpt":
 		if a.File == "" {

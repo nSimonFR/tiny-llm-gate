@@ -12,6 +12,7 @@ import (
 
 	"github.com/nSimonFR/tiny-llm-gate/internal/auth"
 	"github.com/nSimonFR/tiny-llm-gate/internal/config"
+	"github.com/nSimonFR/tiny-llm-gate/internal/mcp"
 	"github.com/nSimonFR/tiny-llm-gate/internal/resolve"
 )
 
@@ -22,7 +23,8 @@ type Server struct {
 	client   *http.Client
 	logger   *slog.Logger
 	// auths is a per-provider Authenticator, built once at startup.
-	auths map[string]auth.Authenticator
+	auths   map[string]auth.Authenticator
+	bridges []*mcp.Bridge
 }
 
 // New builds a Server. The *http.Client has generous timeouts for streaming
@@ -48,14 +50,42 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Build MCP bridges. They share a separate HTTP client with longer
+	// timeouts suited to MCP streaming responses.
+	var bridges []*mcp.Bridge
+	if len(cfg.MCPBridges) > 0 {
+		mcpTransport := &http.Transport{
+			MaxIdleConns:          8,
+			MaxIdleConnsPerHost:   2,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 120 * time.Second,
+			ForceAttemptHTTP2:     false,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		}
+		mcpClient := &http.Client{Transport: mcpTransport}
+		for name, bcfg := range cfg.MCPBridges {
+			br, err := mcp.NewBridge(name, bcfg, mcpClient, logger)
+			if err != nil {
+				return nil, fmt.Errorf("mcp_bridge %q: %w", name, err)
+			}
+			bridges = append(bridges, br)
+		}
+	}
+
 	return &Server{
 		cfg:      cfg,
 		resolver: resolve.New(cfg),
 		// No overall Timeout — streaming responses can legitimately run
 		// for minutes. Per-phase timeouts live on the Transport.
-		client: &http.Client{Transport: transport},
-		logger: logger,
-		auths:  auths,
+		client:  &http.Client{Transport: transport},
+		logger:  logger,
+		auths:   auths,
+		bridges: bridges,
 	}, nil
 }
 
@@ -69,20 +99,30 @@ func buildAuthenticators(cfg *config.Config) (map[string]auth.Authenticator, err
 		if a == nil {
 			continue
 		}
-		switch a.Type {
-		case "bearer":
-			out[name] = auth.Bearer{Token: a.Token}
-		case "oauth_chatgpt":
-			oa, err := auth.NewChatGPTOAuth(a.File, a.Issuer, a.ClientID)
-			if err != nil {
-				return nil, fmt.Errorf("provider %q oauth: %w", name, err)
-			}
-			out[name] = oa
-		default:
-			return nil, fmt.Errorf("provider %q: unsupported auth type %q", name, a.Type)
+		authn, err := auth.Build(authConfigFromConfig(a))
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", name, err)
+		}
+		if authn != nil {
+			out[name] = authn
 		}
 	}
 	return out, nil
+}
+
+// authConfigFromConfig converts a config.Auth to an auth.AuthConfig.
+func authConfigFromConfig(a *config.Auth) *auth.AuthConfig {
+	if a == nil {
+		return nil
+	}
+	return &auth.AuthConfig{
+		Type:      a.Type,
+		Token:     a.Token,
+		TokenFile: a.TokenFile,
+		File:      a.File,
+		Issuer:    a.Issuer,
+		ClientID:  a.ClientID,
+	}
 }
 
 // Handler returns the HTTP handler for this server.
@@ -104,6 +144,11 @@ func (s *Server) Handler() http.Handler {
 	// Health and readiness
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /ready", s.handleReady)
+
+	// MCP bridges
+	for _, br := range s.bridges {
+		br.RegisterRoutes(mux)
+	}
 
 	return withRequestID(mux)
 }
@@ -142,8 +187,11 @@ func (s *Server) routeGemini(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Shutdown gracefully closes idle upstream connections.
+// Shutdown gracefully closes idle upstream connections and MCP bridges.
 func (s *Server) Shutdown(ctx context.Context) error {
+	for _, br := range s.bridges {
+		_ = br.Shutdown(ctx)
+	}
 	s.client.CloseIdleConnections()
 	return nil
 }
