@@ -98,6 +98,7 @@ func (s *Server) Handler() http.Handler {
 	// where `:action` is a suffix on the final path segment, not a separator
 	// Go's ServeMux handles natively. We route by prefix and dispatch on the
 	// action in a single handler.
+	mux.HandleFunc("GET /v1beta/models", s.handleGeminiModels)
 	mux.HandleFunc("POST /v1beta/models/", s.routeGemini)
 
 	// Health and readiness

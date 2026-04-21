@@ -334,6 +334,26 @@ func (s *Server) sendGeminiEmbedRequest(
 	return &out, nil
 }
 
+// handleGeminiModels responds to GET /v1beta/models with the Gemini model
+// listing format. AFFiNE's GeminiGenerativeProvider calls this to populate
+// its onlineModelList, which determines which model names the provider can
+// claim when the CopilotProviderFactory resolves by modelId.
+func (s *Server) handleGeminiModels(w http.ResponseWriter, r *http.Request) {
+	names := s.resolver.ListModels()
+	type geminiModel struct {
+		Name string `json:"name"`
+	}
+	type geminiModelList struct {
+		Models []geminiModel `json:"models"`
+	}
+	out := geminiModelList{Models: make([]geminiModel, 0, len(names))}
+	for _, n := range names {
+		out.Models = append(out.Models, geminiModel{Name: "models/" + n})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
 // extractGeminiModel pulls {model} out of /v1beta/models/{model}:action.
 // Uses the last `:` to split so model names with colons in them (e.g.
 // `gemma4:e4b`) round-trip correctly. Returns ("", false) on parse failure.
