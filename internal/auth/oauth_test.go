@@ -73,6 +73,52 @@ func TestChatGPTLoadsFile(t *testing.T) {
 	}
 }
 
+func TestChatGPTSetsAccountIDHeader(t *testing.T) {
+	dir := t.TempDir()
+	access := makeJWT(t, 3600)
+	p := filepath.Join(dir, "auth.json")
+	data, _ := json.MarshalIndent(authJSON{
+		Tokens: authTokens{
+			AccessToken:  access,
+			RefreshToken: "rt",
+			AccountID:    "acct-123",
+		},
+		LastRefresh: time.Now().UTC().Format(time.RFC3339Nano),
+	}, "", "  ")
+	_ = os.WriteFile(p, data, 0o600)
+
+	o, err := NewChatGPTOAuth(p, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://x/", nil)
+	if err := o.Apply(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Header.Get("chatgpt-account-id"); got != "acct-123" {
+		t.Errorf("chatgpt-account-id = %q; want acct-123", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer "+access {
+		t.Errorf("Authorization header missing or wrong: %q", got)
+	}
+}
+
+func TestChatGPTOmitsAccountIDWhenMissing(t *testing.T) {
+	dir := t.TempDir()
+	p := writeAuth(t, dir, makeJWT(t, 3600), "rt", time.Now())
+	o, err := NewChatGPTOAuth(p, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://x/", nil)
+	if err := o.Apply(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Header.Get("chatgpt-account-id"); got != "" {
+		t.Errorf("expected no chatgpt-account-id header when missing, got %q", got)
+	}
+}
+
 func TestChatGPTAppliesFreshToken(t *testing.T) {
 	dir := t.TempDir()
 	// Token expires in an hour — no refresh should fire.

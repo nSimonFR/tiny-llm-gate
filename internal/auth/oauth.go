@@ -86,18 +86,25 @@ func NewChatGPTOAuth(filePath, issuer, clientID string) (*ChatGPTOAuth, error) {
 }
 
 // Apply implements Authenticator. Triggers a synchronous refresh if the
-// current access token is stale or missing.
+// current access token is stale or missing. Sends both the Bearer
+// Authorization header and the `chatgpt-account-id` header expected by the
+// ChatGPT Codex backend — omitting the latter results in HTML 403 login
+// pages instead of JSON API responses.
 func (c *ChatGPTOAuth) Apply(ctx context.Context, req *http.Request) error {
 	if err := c.ensureFresh(ctx); err != nil {
 		return fmt.Errorf("oauth refresh: %w", err)
 	}
 	c.mu.RLock()
 	tok := c.accessToken
+	acct := c.accountID
 	c.mu.RUnlock()
 	if tok == "" {
 		return errors.New("oauth: no access token available")
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
+	if acct != "" {
+		req.Header.Set("chatgpt-account-id", acct)
+	}
 	return nil
 }
 
