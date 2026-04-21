@@ -56,8 +56,17 @@ type UsageMetadata struct {
 }
 
 // EmbedContentRequest is POST /v1beta/models/{model}:embedContent.
+//
+// OutputDimensionality and TaskType are sent by the Vercel `@ai-sdk/google`
+// library on every embed call (via providerOptions). AFFiNE for instance
+// sets OutputDimensionality=1024 so the vector matches its pgvector column
+// width — dropping it on the floor returns the model's native dimension
+// (4096 for qwen3-embedding:8b) and the caller's INSERT fails.
 type EmbedContentRequest struct {
-	Content Content `json:"content"`
+	Content              Content `json:"content"`
+	OutputDimensionality *int    `json:"outputDimensionality,omitempty"`
+	TaskType             string  `json:"taskType,omitempty"`
+	Title                string  `json:"title,omitempty"`
 }
 
 // EmbedContentResponse is its response body.
@@ -78,8 +87,11 @@ type BatchEmbedContentsRequest struct {
 // BatchEmbedRequest wraps a single content to embed in a batch.
 type BatchEmbedRequest struct {
 	// Model may be set but we ignore it — routing happens at the URL level.
-	Model   string  `json:"model,omitempty"`
-	Content Content `json:"content"`
+	Model                string  `json:"model,omitempty"`
+	Content              Content `json:"content"`
+	OutputDimensionality *int    `json:"outputDimensionality,omitempty"`
+	TaskType             string  `json:"taskType,omitempty"`
+	Title                string  `json:"title,omitempty"`
 }
 
 // BatchEmbedContentsResponse carries all resulting vectors.

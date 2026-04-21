@@ -51,8 +51,9 @@ type OpenAIUsage struct {
 
 // OpenAIEmbedRequest is the minimum shape for the embeddings endpoint.
 type OpenAIEmbedRequest struct {
-	Model string   `json:"model"`
-	Input []string `json:"input"`
+	Model      string   `json:"model"`
+	Input      []string `json:"input"`
+	Dimensions *int     `json:"dimensions,omitempty"`
 }
 
 // OpenAIEmbedResponse is the embeddings response.
@@ -188,13 +189,19 @@ func StreamChunkFromOpenAI(raw []byte) (*ChatResponse, error) {
 	return out, nil
 }
 
-// EmbedContentToOpenAI converts a single Gemini embed request.
+// EmbedContentToOpenAI converts a single Gemini embed request. Forwards the
+// Gemini `outputDimensionality` as OpenAI's `dimensions`, which Ollama's
+// OpenAI-compat endpoint respects for Matryoshka-capable embedding models.
 func EmbedContentToOpenAI(in *EmbedContentRequest, model string) (*OpenAIEmbedRequest, error) {
 	text := joinParts(in.Content.Parts)
 	if text == "" {
 		return nil, errors.New("gemini embed: content has no text")
 	}
-	return &OpenAIEmbedRequest{Model: model, Input: []string{text}}, nil
+	return &OpenAIEmbedRequest{
+		Model:      model,
+		Input:      []string{text},
+		Dimensions: in.OutputDimensionality,
+	}, nil
 }
 
 // EmbedContentResponseFromOpenAI extracts the first embedding back into
@@ -207,20 +214,27 @@ func EmbedContentResponseFromOpenAI(resp *OpenAIEmbedResponse) (*EmbedContentRes
 }
 
 // BatchEmbedRequestToOpenAI converts a batch embed request. All sub-requests
-// are grouped into a single OpenAI call with an Input array.
+// are grouped into a single OpenAI call with an Input array. If any
+// sub-request sets `outputDimensionality`, it's propagated as the
+// OpenAI `dimensions`; when sub-requests disagree we take the first value
+// since OpenAI's endpoint is single-valued.
 func BatchEmbedRequestToOpenAI(in *BatchEmbedContentsRequest, model string) (*OpenAIEmbedRequest, error) {
 	inputs := make([]string, 0, len(in.Requests))
+	var dims *int
 	for i, r := range in.Requests {
 		text := joinParts(r.Content.Parts)
 		if text == "" {
 			return nil, fmt.Errorf("batch embed: request #%d has no text", i)
 		}
 		inputs = append(inputs, text)
+		if dims == nil && r.OutputDimensionality != nil {
+			dims = r.OutputDimensionality
+		}
 	}
 	if len(inputs) == 0 {
 		return nil, errors.New("batch embed: empty request list")
 	}
-	return &OpenAIEmbedRequest{Model: model, Input: inputs}, nil
+	return &OpenAIEmbedRequest{Model: model, Input: inputs, Dimensions: dims}, nil
 }
 
 // BatchEmbedResponseFromOpenAI converts an OpenAI embed response back into

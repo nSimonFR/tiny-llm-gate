@@ -121,6 +121,39 @@ func TestStreamChunkFinishOnlyPreserved(t *testing.T) {
 	}
 }
 
+func TestEmbedContentForwardsOutputDimensionality(t *testing.T) {
+	dims := 1024
+	in := &EmbedContentRequest{
+		Content:              Content{Parts: []Part{{Text: "hello"}}},
+		OutputDimensionality: &dims,
+		TaskType:             "RETRIEVAL_DOCUMENT",
+	}
+	out, err := EmbedContentToOpenAI(in, "qwen3-embedding:8b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Dimensions == nil || *out.Dimensions != 1024 {
+		t.Errorf("dimensions not forwarded: %+v", out.Dimensions)
+	}
+}
+
+func TestBatchEmbedForwardsFirstNonNilDimensionality(t *testing.T) {
+	d := 768
+	in := &BatchEmbedContentsRequest{
+		Requests: []BatchEmbedRequest{
+			{Content: Content{Parts: []Part{{Text: "a"}}}},
+			{Content: Content{Parts: []Part{{Text: "b"}}}, OutputDimensionality: &d},
+		},
+	}
+	out, err := BatchEmbedRequestToOpenAI(in, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Dimensions == nil || *out.Dimensions != 768 {
+		t.Errorf("expected dims=768, got %+v", out.Dimensions)
+	}
+}
+
 func TestEmbedContentRoundTrip(t *testing.T) {
 	in := &EmbedContentRequest{Content: Content{Parts: []Part{{Text: "hello"}}}}
 	toOA, err := EmbedContentToOpenAI(in, "emb-model")

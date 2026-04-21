@@ -11,9 +11,9 @@
       let
         pkgs = import nixpkgs { inherit system; };
         version =
-          if self ? shortRev then "0.3.2-${self.shortRev}"
-          else if self ? dirtyShortRev then "0.3.2-${self.dirtyShortRev}"
-          else "0.3.2-dev";
+          if self ? shortRev then "0.3.3-${self.shortRev}"
+          else if self ? dirtyShortRev then "0.3.3-${self.dirtyShortRev}"
+          else "0.3.3-dev";
       in
       {
         packages.default = pkgs.buildGoModule {
