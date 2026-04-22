@@ -241,6 +241,106 @@ func TestFallbackExhausted(t *testing.T) {
 	}
 }
 
+func TestNoFallbackOnWrapped4xxInvalidRequestError(t *testing.T) {
+	// Native OpenAI error with type "invalid_request_error".
+	primary := newMockUpstream(500, `{"error":{"message":"Invalid tool name","type":"invalid_request_error"}}`)
+	defer primary.Close()
+	secondary := newMockUpstream(200, `{"id":"x","choices":[{"message":{"content":"hi"}}]}`)
+	defer secondary.Close()
+
+	s := buildServer(t,
+		map[string]config.Provider{
+			"codex":  {Type: "openai", BaseURL: primary.URL + "/v1"},
+			"ollama": {Type: "openai", BaseURL: secondary.URL + "/v1"},
+		},
+		map[string]config.Model{
+			"gpt-5":  {Provider: "codex", UpstreamModel: "gpt-5", Fallback: []string{"gemma4"}},
+			"gemma4": {Provider: "ollama", UpstreamModel: "gemma4:e4b"},
+		},
+		nil,
+	)
+
+	rec := postJSON(t, s.Handler(), "/v1/chat/completions", map[string]any{
+		"model":    "gpt-5",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 400 {
+		t.Fatalf("expected 400 (wrapped client error), got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if secondary.mu.requests.Load() != 0 {
+		t.Errorf("expected 0 requests to secondary (no fallback), got %d", secondary.mu.requests.Load())
+	}
+}
+
+func TestNoFallbackOnWrapped4xx(t *testing.T) {
+	// Simulate openai-oauth wrapping a 400 as 500 with
+	// type "server_error" but an OpenAI validation message prefix.
+	primary := newMockUpstream(500, `{"error":{"message":"Invalid 'input[1].name': string does not match pattern.","type":"server_error"}}`)
+	defer primary.Close()
+	secondary := newMockUpstream(200, `{"id":"x","choices":[{"message":{"content":"hi"}}]}`)
+	defer secondary.Close()
+
+	s := buildServer(t,
+		map[string]config.Provider{
+			"codex":  {Type: "openai", BaseURL: primary.URL + "/v1"},
+			"ollama": {Type: "openai", BaseURL: secondary.URL + "/v1"},
+		},
+		map[string]config.Model{
+			"gpt-5":  {Provider: "codex", UpstreamModel: "gpt-5", Fallback: []string{"gemma4"}},
+			"gemma4": {Provider: "ollama", UpstreamModel: "gemma4:e4b"},
+		},
+		nil,
+	)
+
+	rec := postJSON(t, s.Handler(), "/v1/chat/completions", map[string]any{
+		"model":    "gpt-5",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	// Should NOT fall back — should pass through as 400.
+	if rec.Code != 400 {
+		t.Fatalf("expected 400 (wrapped client error), got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if secondary.mu.requests.Load() != 0 {
+		t.Errorf("expected 0 requests to secondary (no fallback), got %d", secondary.mu.requests.Load())
+	}
+	// Body should contain the original error.
+	if !strings.Contains(rec.Body.String(), "Invalid '") {
+		t.Errorf("expected original error message in body, got: %s", rec.Body.String())
+	}
+}
+
+func TestFallbackOnReal5xx(t *testing.T) {
+	// A genuine 500 with type "server_error" should still trigger fallback.
+	primary := newMockUpstream(500, `{"error":{"message":"internal error","type":"server_error"}}`)
+	defer primary.Close()
+	secondary := newMockUpstream(200, `{"id":"x","choices":[{"message":{"content":"hi"}}]}`)
+	defer secondary.Close()
+
+	s := buildServer(t,
+		map[string]config.Provider{
+			"codex":  {Type: "openai", BaseURL: primary.URL + "/v1"},
+			"ollama": {Type: "openai", BaseURL: secondary.URL + "/v1"},
+		},
+		map[string]config.Model{
+			"gpt-5":  {Provider: "codex", UpstreamModel: "gpt-5", Fallback: []string{"gemma4"}},
+			"gemma4": {Provider: "ollama", UpstreamModel: "gemma4:e4b"},
+		},
+		nil,
+	)
+
+	rec := postJSON(t, s.Handler(), "/v1/chat/completions", map[string]any{
+		"model":    "gpt-5",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	// Should fall back to secondary and succeed.
+	if rec.Code != 200 {
+		t.Fatalf("expected 200 after fallback, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if secondary.mu.requests.Load() != 1 {
+		t.Errorf("expected 1 request to secondary, got %d", secondary.mu.requests.Load())
+	}
+}
+
 func TestUnknownModelReturns404(t *testing.T) {
 	s := buildServer(t,
 		map[string]config.Provider{

@@ -161,9 +161,18 @@ func (s *Server) sendUpstream(
 
 	// Retryable upstream error: consume body to free the connection and
 	// bubble up so the caller tries the next fallback.
+	//
+	// Exception: some proxies (e.g. openai-oauth) wrap client errors as
+	// 500 by re-throwing in a catch-all handler. When the JSON body
+	// contains an OpenAI error with type "invalid_request_error", the
+	// error is non-retryable — pass it through instead of falling back.
 	if resp.StatusCode >= 500 && canRetry {
-		drain(resp.Body)
-		return false, fmt.Errorf("upstream status %d", resp.StatusCode)
+		if isWrappedClientError(resp) {
+			resp.StatusCode = http.StatusBadRequest
+		} else {
+			drain(resp.Body)
+			return false, fmt.Errorf("upstream status %d", resp.StatusCode)
+		}
 	}
 
 	// Commit response to client.
@@ -332,6 +341,46 @@ func trimTrailingNewline(b *bytes.Buffer) {
 	if b.Bytes()[b.Len()-1] == '\n' {
 		b.Truncate(b.Len() - 1)
 	}
+}
+
+// isWrappedClientError peeks at the response body of a 5xx to detect
+// upstream proxies that wrap 4xx errors as 500. It checks for:
+//   - type "invalid_request_error" (native OpenAI errors)
+//   - OpenAI validation messages (e.g. "Invalid 'input[...") even when the
+//     proxy overwrites the type to "server_error" (openai-oauth does this)
+//
+// When detected it replaces resp.Body with the buffered content so the
+// caller can still stream it.
+func isWrappedClientError(resp *http.Response) bool {
+	// Read up to 8KB — enough for any error envelope.
+	limited := io.LimitReader(resp.Body, 8192)
+	peek, err := io.ReadAll(limited)
+	if err != nil || len(peek) == 0 {
+		return false
+	}
+	// Drain any remainder and replace body with what we read.
+	drain(resp.Body)
+	resp.Body = io.NopCloser(bytes.NewReader(peek))
+
+	var envelope struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(peek, &envelope) != nil {
+		return false
+	}
+	if envelope.Error.Type == "invalid_request_error" {
+		return true
+	}
+	// openai-oauth wraps all errors as type "server_error", but the
+	// message is preserved from the upstream. Detect OpenAI validation
+	// errors by their characteristic prefix.
+	if strings.HasPrefix(envelope.Error.Message, "Invalid '") {
+		return true
+	}
+	return false
 }
 
 func writeJSONError(w http.ResponseWriter, status int, message string) {
