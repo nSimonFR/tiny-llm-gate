@@ -34,8 +34,10 @@ type OpenAIFunction struct {
 
 // OpenAIMessage is a single message.
 type OpenAIMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string           `json:"role"`
+	Content    string           `json:"content"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
 }
 
 // OpenAIToolCall is a tool invocation in a response.
@@ -122,7 +124,8 @@ type OpenAIDelta struct {
 }
 
 // ChatRequestToOpenAI converts a Gemini chat request into the OpenAI wire
-// format. Text-only — any non-text parts are dropped with an error.
+// format. Handles text, function calls (model→assistant with tool_calls),
+// and function responses (user→tool with tool_call_id).
 func ChatRequestToOpenAI(in *ChatRequest, model string, stream bool) (*OpenAIChatRequest, error) {
 	out := &OpenAIChatRequest{
 		Model:  model,
@@ -137,8 +140,91 @@ func ChatRequestToOpenAI(in *ChatRequest, model string, stream bool) (*OpenAICha
 			})
 		}
 	}
+
+	// Track generated tool_call_ids so we can match functionResponse to
+	// the correct prior assistant tool_call. Key: function name, value:
+	// queue of IDs (multiple calls to the same function are possible).
+	pendingIDs := make(map[string][]string) // name → []id
+	callSeq := 0
+
 	for _, c := range in.Contents {
-		text := joinParts(c.Parts)
+		// Classify parts in this Content.
+		var textParts []Part
+		var fcParts []Part       // functionCall (model)
+		var frParts []Part       // functionResponse (user)
+		for _, p := range c.Parts {
+			switch {
+			case p.FunctionCall != nil:
+				fcParts = append(fcParts, p)
+			case p.FunctionResponse != nil:
+				frParts = append(frParts, p)
+			default:
+				textParts = append(textParts, p)
+			}
+		}
+
+		// Model message with function calls → assistant with tool_calls.
+		if len(fcParts) > 0 {
+			msg := OpenAIMessage{Role: "assistant"}
+			text := joinParts(textParts)
+			msg.Content = text
+			for _, p := range fcParts {
+				id := fmt.Sprintf("gemini_call_%d", callSeq)
+				callSeq++
+				pendingIDs[p.FunctionCall.Name] = append(pendingIDs[p.FunctionCall.Name], id)
+				msg.ToolCalls = append(msg.ToolCalls, OpenAIToolCall{
+					Index: len(msg.ToolCalls),
+					ID:    id,
+					Type:  "function",
+					Function: struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					}{
+						Name:      p.FunctionCall.Name,
+						Arguments: string(p.FunctionCall.Args),
+					},
+				})
+			}
+			out.Messages = append(out.Messages, msg)
+			continue
+		}
+
+		// Function responses → one "tool" message per response.
+		if len(frParts) > 0 {
+			for _, p := range frParts {
+				fr := p.FunctionResponse
+				// Find matching tool_call_id.
+				toolCallID := ""
+				if ids, ok := pendingIDs[fr.Name]; ok && len(ids) > 0 {
+					toolCallID = ids[0]
+					pendingIDs[fr.Name] = ids[1:]
+				} else {
+					// No matching call found; generate a synthetic ID.
+					toolCallID = fmt.Sprintf("gemini_call_%d", callSeq)
+					callSeq++
+				}
+				content := string(fr.Response)
+				if content == "" {
+					content = "{}"
+				}
+				out.Messages = append(out.Messages, OpenAIMessage{
+					Role:       "tool",
+					Content:    content,
+					ToolCallID: toolCallID,
+				})
+			}
+			// Also emit any text in the same Content as a user message.
+			if text := joinParts(textParts); text != "" {
+				out.Messages = append(out.Messages, OpenAIMessage{
+					Role:    mapRoleToOpenAI(c.Role),
+					Content: text,
+				})
+			}
+			continue
+		}
+
+		// Plain text message.
+		text := joinParts(textParts)
 		if text == "" {
 			continue
 		}

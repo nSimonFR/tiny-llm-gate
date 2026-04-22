@@ -203,6 +203,109 @@ func TestBatchEmbedRoundTrip(t *testing.T) {
 	}
 }
 
+func TestChatRequestToOpenAIFunctionCallRoundTrip(t *testing.T) {
+	// Simulate a conversation where:
+	// 1. User asks a question
+	// 2. Model calls a tool (functionCall)
+	// 3. User sends tool result (functionResponse)
+	// 4. User asks followup
+	in := &ChatRequest{
+		Contents: []Content{
+			{Role: "user", Parts: []Part{{Text: "Search for cats"}}},
+			{Role: "model", Parts: []Part{{
+				FunctionCall: &FunctionCall{
+					Name: "docSemanticSearch",
+					Args: json.RawMessage(`{"query":"cats"}`),
+				},
+			}}},
+			{Role: "user", Parts: []Part{{
+				FunctionResponse: &FunctionResponse{
+					Name:     "docSemanticSearch",
+					Response: json.RawMessage(`{"results":["doc1","doc2"]}`),
+				},
+			}}},
+			{Role: "user", Parts: []Part{{Text: "Now summarize"}}},
+		},
+		Tools: []Tool{{FunctionDeclarations: []FunctionDeclaration{{
+			Name:        "docSemanticSearch",
+			Description: "Search docs",
+			Parameters:  json.RawMessage(`{"type":"object"}`),
+		}}}},
+	}
+
+	out, err := ChatRequestToOpenAI(in, "test-model", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Expect: user, assistant(tool_calls), tool, user
+	if len(out.Messages) != 4 {
+		t.Fatalf("messages=%d want 4, got: %+v", len(out.Messages), out.Messages)
+	}
+	// 1. User text
+	if out.Messages[0].Role != "user" || out.Messages[0].Content != "Search for cats" {
+		t.Errorf("msg[0] wrong: %+v", out.Messages[0])
+	}
+	// 2. Assistant with tool_calls
+	if out.Messages[1].Role != "assistant" || len(out.Messages[1].ToolCalls) != 1 {
+		t.Errorf("msg[1] wrong: %+v", out.Messages[1])
+	}
+	tc := out.Messages[1].ToolCalls[0]
+	if tc.Function.Name != "docSemanticSearch" || tc.Function.Arguments != `{"query":"cats"}` {
+		t.Errorf("tool call wrong: %+v", tc)
+	}
+	// 3. Tool result with matching ID
+	if out.Messages[2].Role != "tool" || out.Messages[2].ToolCallID != tc.ID {
+		t.Errorf("msg[2] wrong: role=%s tool_call_id=%s want %s", out.Messages[2].Role, out.Messages[2].ToolCallID, tc.ID)
+	}
+	if out.Messages[2].Content != `{"results":["doc1","doc2"]}` {
+		t.Errorf("tool content wrong: %s", out.Messages[2].Content)
+	}
+	// 4. User followup
+	if out.Messages[3].Role != "user" || out.Messages[3].Content != "Now summarize" {
+		t.Errorf("msg[3] wrong: %+v", out.Messages[3])
+	}
+	// Tools forwarded
+	if len(out.Tools) != 1 || out.Tools[0].Function.Name != "docSemanticSearch" {
+		t.Errorf("tools wrong: %+v", out.Tools)
+	}
+}
+
+func TestChatRequestToOpenAIMultipleFunctionCalls(t *testing.T) {
+	// Model calls two tools at once, both results come back
+	in := &ChatRequest{
+		Contents: []Content{
+			{Role: "user", Parts: []Part{{Text: "Hi"}}},
+			{Role: "model", Parts: []Part{
+				{FunctionCall: &FunctionCall{Name: "search", Args: json.RawMessage(`{"q":"a"}`)}},
+				{FunctionCall: &FunctionCall{Name: "search", Args: json.RawMessage(`{"q":"b"}`)}},
+			}},
+			{Role: "user", Parts: []Part{
+				{FunctionResponse: &FunctionResponse{Name: "search", Response: json.RawMessage(`"result_a"`)}},
+				{FunctionResponse: &FunctionResponse{Name: "search", Response: json.RawMessage(`"result_b"`)}},
+			}},
+		},
+	}
+	out, err := ChatRequestToOpenAI(in, "m", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// user, assistant(2 tool_calls), tool, tool
+	if len(out.Messages) != 4 {
+		t.Fatalf("messages=%d want 4", len(out.Messages))
+	}
+	if len(out.Messages[1].ToolCalls) != 2 {
+		t.Fatalf("tool_calls=%d want 2", len(out.Messages[1].ToolCalls))
+	}
+	// Each tool message should match the corresponding call's ID
+	if out.Messages[2].ToolCallID != out.Messages[1].ToolCalls[0].ID {
+		t.Errorf("first tool_call_id mismatch")
+	}
+	if out.Messages[3].ToolCallID != out.Messages[1].ToolCalls[1].ID {
+		t.Errorf("second tool_call_id mismatch")
+	}
+}
+
 // Sanity: the produced OpenAI request JSON-serializes to the shape LiteLLM
 // consumes. Mostly guards against silent struct-tag drift.
 func TestOpenAIRequestJSONShape(t *testing.T) {

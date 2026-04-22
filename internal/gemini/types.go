@@ -38,14 +38,21 @@ type Content struct {
 
 // Part is one chunk of a message.
 type Part struct {
-	Text         string        `json:"text,omitempty"`
-	FunctionCall *FunctionCall `json:"functionCall,omitempty"`
+	Text             string            `json:"text,omitempty"`
+	FunctionCall     *FunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *FunctionResponse `json:"functionResponse,omitempty"`
 }
 
 // FunctionCall is emitted by the model when it wants to invoke a tool.
 type FunctionCall struct {
 	Name string          `json:"name"`
 	Args json.RawMessage `json:"args,omitempty"`
+}
+
+// FunctionResponse is sent by the client with the result of a tool invocation.
+type FunctionResponse struct {
+	Name     string          `json:"name"`
+	Response json.RawMessage `json:"response,omitempty"`
 }
 
 // GenerationConfig is the subset of sampling parameters we translate.
