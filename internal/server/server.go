@@ -141,6 +141,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1beta/models", s.handleGeminiModels)
 	mux.HandleFunc("POST /v1beta/models/", s.routeGemini)
 
+	// Anthropic frontend (pass-through proxy to api.anthropic.com)
+	if s.cfg.Anthropic != nil {
+		mux.HandleFunc("POST /v1/messages", s.handleAnthropicMessages)
+	}
+
 	// Health and readiness
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /ready", s.handleReady)

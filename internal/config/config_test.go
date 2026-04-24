@@ -345,3 +345,68 @@ func TestParseMCPBridgeNoBridges(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestParseAnthropic(t *testing.T) {
+	c, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+  shadow_url: http://ai.gate-mintaka.ts.net/v1/chat/completions
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Anthropic == nil {
+		t.Fatal("expected anthropic section")
+	}
+	if c.Anthropic.Upstream != "https://api.anthropic.com" {
+		t.Errorf("upstream = %q", c.Anthropic.Upstream)
+	}
+	if c.Anthropic.ShadowURL != "http://ai.gate-mintaka.ts.net/v1/chat/completions" {
+		t.Errorf("shadow_url = %q", c.Anthropic.ShadowURL)
+	}
+}
+
+func TestParseAnthropicNoShadow(t *testing.T) {
+	c, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Anthropic == nil || c.Anthropic.ShadowURL != "" {
+		t.Errorf("expected anthropic with empty shadow_url, got %+v", c.Anthropic)
+	}
+}
+
+func TestParseAnthropicMissingUpstream(t *testing.T) {
+	_, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  shadow_url: http://x/v1/chat/completions
+`))
+	if err == nil {
+		t.Error("expected error for anthropic without upstream")
+	}
+}
+
+func TestParseAnthropicAbsent(t *testing.T) {
+	c, err := Parse([]byte(validConfig))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Anthropic != nil {
+		t.Errorf("expected nil anthropic, got %+v", c.Anthropic)
+	}
+}

@@ -18,6 +18,20 @@ type Config struct {
 	Aliases    map[string]string     `yaml:"aliases"`
 	DropParams bool                  `yaml:"drop_params"`
 	MCPBridges map[string]MCPBridge  `yaml:"mcp_bridges,omitempty"`
+	Anthropic  *Anthropic            `yaml:"anthropic,omitempty"`
+}
+
+// Anthropic configures the pass-through proxy for Anthropic's /v1/messages
+// API. When set, tiny-llm-gate accepts Anthropic-format requests, forwards
+// them to Upstream with the client's own auth, and optionally sends a shadow
+// request to ShadowURL for observability logging (e.g. through Aperture).
+type Anthropic struct {
+	// Upstream is the Anthropic API root (e.g. "https://api.anthropic.com").
+	Upstream string `yaml:"upstream"`
+	// ShadowURL is the OpenAI-compatible endpoint to POST shadow requests
+	// to (e.g. "http://ai.gate-mintaka.ts.net/v1/chat/completions").
+	// Optional: when empty, no shadow requests are sent.
+	ShadowURL string `yaml:"shadow_url,omitempty"`
 }
 
 // MCPBridge configures an MCP protocol transport bridge. It accepts
@@ -170,6 +184,11 @@ func (c *Config) validate() error {
 	}
 	if err := c.validateMCPBridges(); err != nil {
 		return err
+	}
+	if c.Anthropic != nil {
+		if c.Anthropic.Upstream == "" {
+			return errors.New("anthropic: upstream is required")
+		}
 	}
 	return nil
 }
