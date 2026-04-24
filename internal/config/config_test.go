@@ -345,3 +345,89 @@ func TestParseMCPBridgeNoBridges(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestParseAnthropicWithAuth(t *testing.T) {
+	c, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+  auth:
+    type: bearer
+    token_file: /run/agenix/claude-oauth
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Anthropic == nil {
+		t.Fatal("expected anthropic section")
+	}
+	if c.Anthropic.Upstream != "https://api.anthropic.com" {
+		t.Errorf("upstream = %q", c.Anthropic.Upstream)
+	}
+	if c.Anthropic.Auth == nil || c.Anthropic.Auth.Type != "bearer" {
+		t.Fatalf("anthropic auth = %+v", c.Anthropic.Auth)
+	}
+	if c.Anthropic.Auth.TokenFile != "/run/agenix/claude-oauth" {
+		t.Errorf("token_file = %q", c.Anthropic.Auth.TokenFile)
+	}
+}
+
+func TestParseAnthropicNoAuth(t *testing.T) {
+	// Valid — anthropic without auth sends requests unauthenticated.
+	c, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Anthropic == nil || c.Anthropic.Auth != nil {
+		t.Errorf("expected anthropic with nil auth, got %+v", c.Anthropic)
+	}
+}
+
+func TestParseAnthropicMissingUpstream(t *testing.T) {
+	_, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  auth: { type: bearer, token: abc }
+`))
+	if err == nil {
+		t.Error("expected error for anthropic without upstream")
+	}
+}
+
+func TestParseAnthropicInvalidAuth(t *testing.T) {
+	_, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+  auth: { type: bearer }
+`))
+	if err == nil {
+		t.Error("expected error for bearer auth without token or token_file")
+	}
+}
+
+func TestParseAnthropicAbsent(t *testing.T) {
+	c, err := Parse([]byte(validConfig))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Anthropic != nil {
+		t.Errorf("expected nil anthropic, got %+v", c.Anthropic)
+	}
+}

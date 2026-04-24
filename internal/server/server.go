@@ -25,6 +25,9 @@ type Server struct {
 	// auths is a per-provider Authenticator, built once at startup.
 	auths   map[string]auth.Authenticator
 	bridges []*mcp.Bridge
+	// anthropicAuth is the authenticator applied to /v1/messages requests
+	// forwarded to the Anthropic API. nil when no auth is configured.
+	anthropicAuth auth.Authenticator
 }
 
 // New builds a Server. The *http.Client has generous timeouts for streaming
@@ -77,15 +80,27 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		}
 	}
 
+	// Build the Anthropic frontend authenticator (applied to /v1/messages
+	// requests forwarded upstream).
+	var anthropicAuth auth.Authenticator
+	if cfg.Anthropic != nil && cfg.Anthropic.Auth != nil {
+		authn, err := auth.Build(authConfigFromConfig(cfg.Anthropic.Auth))
+		if err != nil {
+			return nil, fmt.Errorf("anthropic auth: %w", err)
+		}
+		anthropicAuth = authn
+	}
+
 	return &Server{
 		cfg:      cfg,
 		resolver: resolve.New(cfg),
 		// No overall Timeout — streaming responses can legitimately run
 		// for minutes. Per-phase timeouts live on the Transport.
-		client:  &http.Client{Transport: transport},
-		logger:  logger,
-		auths:   auths,
-		bridges: bridges,
+		client:        &http.Client{Transport: transport},
+		logger:        logger,
+		auths:         auths,
+		bridges:       bridges,
+		anthropicAuth: anthropicAuth,
 	}, nil
 }
 
@@ -140,6 +155,13 @@ func (s *Server) Handler() http.Handler {
 	// action in a single handler.
 	mux.HandleFunc("GET /v1beta/models", s.handleGeminiModels)
 	mux.HandleFunc("POST /v1beta/models/", s.routeGemini)
+
+	// Anthropic frontend (pass-through proxy to api.anthropic.com).
+	// Registered only when configured so clients hit 404 for /v1/messages
+	// on gates that don't have Anthropic support enabled.
+	if s.cfg.Anthropic != nil {
+		mux.HandleFunc("POST /v1/messages", s.handleAnthropicMessages)
+	}
 
 	// Health and readiness
 	mux.HandleFunc("GET /health", s.handleHealth)

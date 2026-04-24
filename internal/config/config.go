@@ -18,6 +18,21 @@ type Config struct {
 	Aliases    map[string]string     `yaml:"aliases"`
 	DropParams bool                  `yaml:"drop_params"`
 	MCPBridges map[string]MCPBridge  `yaml:"mcp_bridges,omitempty"`
+	Anthropic  *Anthropic            `yaml:"anthropic,omitempty"`
+}
+
+// Anthropic configures the pass-through proxy for Anthropic's /v1/messages
+// API. When set, tiny-llm-gate exposes POST /v1/messages and forwards each
+// request to Upstream with the configured credentials applied. Intended to
+// sit behind an observability layer (e.g. Tailscale Aperture) so the full
+// request and response are logged there.
+type Anthropic struct {
+	// Upstream is the Anthropic API root (e.g. "https://api.anthropic.com").
+	Upstream string `yaml:"upstream"`
+	// Auth configures the upstream credentials. Typically a bearer token
+	// acquired via `claude setup-token` and stored in a file managed by a
+	// secret-management system (e.g. agenix).
+	Auth *Auth `yaml:"auth,omitempty"`
 }
 
 // MCPBridge configures an MCP protocol transport bridge. It accepts
@@ -170,6 +185,16 @@ func (c *Config) validate() error {
 	}
 	if err := c.validateMCPBridges(); err != nil {
 		return err
+	}
+	if c.Anthropic != nil {
+		if c.Anthropic.Upstream == "" {
+			return errors.New("anthropic: upstream is required")
+		}
+		if c.Anthropic.Auth != nil {
+			if err := validateAuth("anthropic", c.Anthropic.Auth); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
