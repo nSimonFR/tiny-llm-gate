@@ -270,48 +270,6 @@ func TestShadowEchoReturnsValidOpenAI(t *testing.T) {
 	}
 }
 
-func TestShadowEchoReturnsUsageFromXUsage(t *testing.T) {
-	s := buildServer(t,
-		map[string]config.Provider{
-			"ollama": {Type: "openai", BaseURL: "http://localhost:1/v1"},
-		},
-		map[string]config.Model{
-			"stub": {Provider: "ollama", UpstreamModel: "stub"},
-		},
-		nil,
-	)
-
-	rec := postJSON(t, s.Handler(), "/v1/chat/completions", map[string]any{
-		"model":    "cc/claude-opus-4-6",
-		"messages": []map[string]any{{"role": "user", "content": "shadow"}},
-		"x_usage":  map[string]int{"prompt_tokens": 500, "completion_tokens": 42, "total_tokens": 542},
-	})
-
-	if rec.Code != 200 {
-		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	var resp struct {
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-	if resp.Usage.PromptTokens != 500 {
-		t.Errorf("prompt_tokens = %d, want 500", resp.Usage.PromptTokens)
-	}
-	if resp.Usage.CompletionTokens != 42 {
-		t.Errorf("completion_tokens = %d, want 42", resp.Usage.CompletionTokens)
-	}
-	if resp.Usage.TotalTokens != 542 {
-		t.Errorf("total_tokens = %d, want 542", resp.Usage.TotalTokens)
-	}
-}
-
 func TestAnthropicDisabledWhenNilConfig(t *testing.T) {
 	s := buildServer(t,
 		map[string]config.Provider{

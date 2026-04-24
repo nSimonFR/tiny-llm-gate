@@ -231,48 +231,37 @@ func anthropicCopyExtractUsage(w http.ResponseWriter, body io.Reader, model stri
 // fireShadow sends a fire-and-forget shadow request to the configured
 // ShadowURL (typically Aperture) for observability logging. The request
 // uses OpenAI /v1/chat/completions format with a cc/ prefixed model name.
-// Real token usage from the Anthropic response is embedded in the request
-// body via x_usage so the echo handler can return it in the response —
-// this is what Aperture reads for cost tracking.
 func (s *Server) fireShadow(usage anthropicUsage) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	shadowModel := shadowModelPrefix + usage.Model
-	totalInput := usage.InputTokens + usage.CacheReadInputTokens + usage.CacheCreateTokens
 	payload, _ := json.Marshal(map[string]any{
 		"model":      shadowModel,
 		"messages":   []map[string]string{{"role": "user", "content": "shadow"}},
 		"max_tokens": 1,
-		// Embed real usage for the echo handler to return in the response.
-		"x_usage": map[string]int{
-			"prompt_tokens":     totalInput,
-			"completion_tokens": usage.OutputTokens,
-			"total_tokens":      totalInput + usage.OutputTokens,
-		},
 	})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.Anthropic.ShadowURL, bytes.NewReader(payload))
 	if err != nil {
-		s.logger.Warn("shadow: build request", "err", err)
+		s.logger.Debug("shadow: build request", "err", err)
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		s.logger.Warn("shadow: transport", "err", err)
+		s.logger.Debug("shadow: transport", "err", err)
 		return
 	}
 	drain(resp.Body)
 	resp.Body.Close()
 
-	s.logger.Info("shadow",
+	s.logger.Debug("shadow: sent",
 		"model", shadowModel,
 		"status", resp.StatusCode,
 		"input_tokens", usage.InputTokens,
 		"output_tokens", usage.OutputTokens,
 		"cache_read", usage.CacheReadInputTokens,
-		"cache_create", usage.CacheCreateTokens,
 	)
 }
