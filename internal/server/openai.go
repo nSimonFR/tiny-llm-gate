@@ -70,7 +70,7 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, upstreamPat
 	// Shadow echo: cc/ prefixed models are shadow requests arriving back
 	// from Aperture. Return a canned response so Aperture logs the round-trip.
 	if strings.HasPrefix(peek.Model, shadowModelPrefix) {
-		s.handleShadowEcho(w, r, peek.Model)
+		s.handleShadowEcho(w, r, peek.Model, body)
 		return
 	}
 
@@ -428,8 +428,22 @@ type modelListItem struct {
 // handleShadowEcho responds to shadow requests (cc/ prefixed models) with a
 // minimal valid OpenAI completion. This is the terminus of the shadow loop:
 // Aperture sees a successful round-trip and logs the model usage.
-func (s *Server) handleShadowEcho(w http.ResponseWriter, r *http.Request, model string) {
+//
+// The real token usage is embedded in the request body as x_usage by
+// fireShadow — we extract it and return it in the response so Aperture
+// can track actual costs.
+func (s *Server) handleShadowEcho(w http.ResponseWriter, r *http.Request, model string, body []byte) {
 	reqID := requestID(r.Context())
+
+	// Extract x_usage from the request body if present.
+	usage := map[string]int{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+	var peek struct {
+		XUsage map[string]int `json:"x_usage"`
+	}
+	if json.Unmarshal(body, &peek) == nil && peek.XUsage != nil {
+		usage = peek.XUsage
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -437,9 +451,14 @@ func (s *Server) handleShadowEcho(w http.ResponseWriter, r *http.Request, model 
 		"object":  "chat.completion",
 		"model":   model,
 		"choices": []map[string]any{{"index": 0, "message": map[string]string{"role": "assistant", "content": ""}, "finish_reason": "stop"}},
-		"usage":   map[string]int{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+		"usage":   usage,
 	})
-	s.logger.Debug("shadow echo", "request_id", reqID, "model", model)
+	s.logger.Info("shadow echo",
+		"request_id", reqID,
+		"model", model,
+		"prompt_tokens", usage["prompt_tokens"],
+		"completion_tokens", usage["completion_tokens"],
+	)
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
