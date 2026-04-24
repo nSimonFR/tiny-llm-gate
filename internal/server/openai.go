@@ -24,9 +24,6 @@ const (
 	embedPath = "/embeddings"
 )
 
-// shadowModelPrefix identifies shadow requests routed back from Aperture.
-const shadowModelPrefix = "cc/"
-
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.proxyOpenAI(w, r, chatPath)
 }
@@ -64,13 +61,6 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, upstreamPat
 	}
 	if peek.Model == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing 'model' field")
-		return
-	}
-
-	// Shadow echo: cc/ prefixed models are shadow requests arriving back
-	// from Aperture. Return a canned response so Aperture logs the round-trip.
-	if strings.HasPrefix(peek.Model, shadowModelPrefix) {
-		s.handleShadowEcho(w, r, peek.Model)
 		return
 	}
 
@@ -423,23 +413,6 @@ type modelListItem struct {
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
-}
-
-// handleShadowEcho responds to shadow requests (cc/ prefixed models) with a
-// minimal valid OpenAI completion. This is the terminus of the shadow loop:
-// Aperture sees a successful round-trip and logs the model usage.
-func (s *Server) handleShadowEcho(w http.ResponseWriter, r *http.Request, model string) {
-	reqID := requestID(r.Context())
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"id":      "shadow-" + reqID,
-		"object":  "chat.completion",
-		"model":   model,
-		"choices": []map[string]any{{"index": 0, "message": map[string]string{"role": "assistant", "content": ""}, "finish_reason": "stop"}},
-		"usage":   map[string]int{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-	})
-	s.logger.Debug("shadow echo", "request_id", reqID, "model", model)
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
