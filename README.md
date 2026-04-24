@@ -19,7 +19,7 @@ If you self-host LLMs (Ollama, llama.cpp) on a small box and want a single endpo
 
 ## Status
 
-**v0.3.0**: OpenAI & Gemini frontends, OpenAI backend with optional ChatGPT OAuth auth, streaming, aliases, fallbacks.
+**v0.3.0**: OpenAI & Gemini frontends, OpenAI backend, streaming, aliases, fallbacks.
 
 See [ROADMAP.md](ROADMAP.md) for remaining phases (production cutover, SIGHUP hot-reload).
 
@@ -71,7 +71,6 @@ models:                     # canonical model names
 aliases:                    # client-facing model name → canonical model
   <alias>: <model>          # chains are supported (cycle-detected)
 
-drop_params: true           # reserved for future use
 ```
 
 See [`testdata/example-config.yaml`](testdata/example-config.yaml) for a fuller example.
@@ -157,7 +156,7 @@ The systemd unit applies sandboxing (`DynamicUser`, `ProtectSystem=strict`, …)
 | Model aliases | ✅ (unified) | ✅ (two kinds) | per-key | via UI |
 | Streaming (SSE) | ✅ | ✅ | ✅ | ✅ |
 | Gemini-format frontend | roadmap | ✅ | partial | ❌ |
-| OAuth backend | roadmap | ✅ | ❌ | ❌ |
+| OAuth backend | ❌ | ✅ | ❌ | ❌ |
 
 ## Non-goals
 

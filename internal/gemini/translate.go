@@ -455,48 +455,6 @@ func BuildToolCallResponse(parts []Part, finishReason string, usage *OpenAIUsage
 	return out
 }
 
-// StreamChunkFromOpenAI converts a single OpenAI SSE chunk to the Gemini
-// streaming JSON shape. This is the simple path for chunks that carry no
-// tool calls. For tool-call-aware streaming, use ParseStreamChunk instead.
-func StreamChunkFromOpenAI(raw []byte) (*ChatResponse, error) {
-	var chunk OpenAIStreamChunk
-	if err := json.Unmarshal(raw, &chunk); err != nil {
-		return nil, fmt.Errorf("parse openai chunk: %w", err)
-	}
-	if len(chunk.Choices) == 0 {
-		return nil, nil
-	}
-	out := &ChatResponse{Candidates: make([]Candidate, 0, len(chunk.Choices))}
-	hasContent := false
-	for _, ch := range chunk.Choices {
-		content := Content{Role: "model"}
-		if ch.Delta.Content != "" {
-			content.Parts = append(content.Parts, Part{Text: ch.Delta.Content})
-			hasContent = true
-		}
-		if tcParts := toolCallsToParts(ch.Delta.ToolCalls); len(tcParts) > 0 {
-			content.Parts = append(content.Parts, tcParts...)
-			hasContent = true
-		}
-		out.Candidates = append(out.Candidates, Candidate{
-			Index:        ch.Index,
-			Content:      content,
-			FinishReason: mapFinishReasonToGemini(ch.FinishReason),
-		})
-	}
-	if !hasContent && allFinishReasonsEmpty(out.Candidates) {
-		return nil, nil
-	}
-	if chunk.Usage != nil {
-		out.UsageMetadata = &UsageMetadata{
-			PromptTokenCount:     chunk.Usage.PromptTokens,
-			CandidatesTokenCount: chunk.Usage.CompletionTokens,
-			TotalTokenCount:      chunk.Usage.TotalTokens,
-		}
-	}
-	return out, nil
-}
-
 // EmbedContentToOpenAI converts a single Gemini embed request. Forwards the
 // Gemini `outputDimensionality` as OpenAI's `dimensions`, which Ollama's
 // OpenAI-compat endpoint respects for Matryoshka-capable embedding models.
@@ -630,13 +588,4 @@ func mapFinishReasonToGemini(r string) string {
 	default:
 		return strings.ToUpper(r)
 	}
-}
-
-func allFinishReasonsEmpty(c []Candidate) bool {
-	for _, x := range c {
-		if x.FinishReason != "" {
-			return false
-		}
-	}
-	return true
 }

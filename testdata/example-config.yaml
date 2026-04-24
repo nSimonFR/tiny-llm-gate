@@ -14,21 +14,11 @@ providers:
     base_url: http://100.125.240.34:11434/v1
     api_key: ollama
 
-  # Option A — legacy codex-proxy (openai-oauth running on :4040):
-  # codex:
-  #   type: openai
-  #   base_url: http://127.0.0.1:4040/v1
-  #   api_key: unused
-  #
-  # Option B — direct to ChatGPT Codex backend with in-process OAuth refresh.
-  # Replaces the openai-codex-proxy service entirely.
+  # Codex proxy on localhost (openai-oauth running on :4040)
   codex:
     type: openai
-    base_url: https://chatgpt.com/backend-api/codex
-    auth:
-      type: oauth_chatgpt
-      file: /home/nsimon/.codex/auth.json
-      # issuer and client_id default to the published ChatGPT Codex values
+    base_url: http://127.0.0.1:4040/v1
+    api_key: unused
 
 models:
   "gemma4:e4b":
@@ -99,5 +89,3 @@ aliases:
   "gemini-2.0-flash-001":   "gemma4:e4b"
   "gemini-embedding-001":   "qwen3-embedding:8b"
   "text-embedding-004":     "qwen3-embedding:8b"
-
-drop_params: true

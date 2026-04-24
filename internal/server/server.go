@@ -134,9 +134,6 @@ func authConfigFromConfig(a *config.Auth) *auth.AuthConfig {
 		Type:      a.Type,
 		Token:     a.Token,
 		TokenFile: a.TokenFile,
-		File:      a.File,
-		Issuer:    a.Issuer,
-		ClientID:  a.ClientID,
 	}
 }
 

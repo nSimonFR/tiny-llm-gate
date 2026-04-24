@@ -34,9 +34,6 @@ func NewBridge(name string, cfg config.MCPBridge, client *http.Client, logger *s
 			Type:      cfg.Auth.Type,
 			Token:     cfg.Auth.Token,
 			TokenFile: cfg.Auth.TokenFile,
-			File:      cfg.Auth.File,
-			Issuer:    cfg.Auth.Issuer,
-			ClientID:  cfg.Auth.ClientID,
 		}
 	}
 	authn, err := auth.Build(ac)

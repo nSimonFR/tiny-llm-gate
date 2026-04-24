@@ -16,7 +16,6 @@ type Config struct {
 	Providers  map[string]Provider   `yaml:"providers"`
 	Models     map[string]Model      `yaml:"models"`
 	Aliases    map[string]string     `yaml:"aliases"`
-	DropParams bool                  `yaml:"drop_params"`
 	MCPBridges map[string]MCPBridge  `yaml:"mcp_bridges,omitempty"`
 	Anthropic  *Anthropic            `yaml:"anthropic,omitempty"`
 }
@@ -68,26 +67,15 @@ type Provider struct {
 
 // Auth is the upstream authentication strategy.
 type Auth struct {
-	// Type is one of: "bearer", "oauth_chatgpt".
+	// Type is the auth strategy. Currently supported: "bearer".
 	Type string `yaml:"type"`
 
-	// -- bearer --
+	// Token is the bearer token value. Mutually exclusive with TokenFile.
 	Token string `yaml:"token,omitempty"`
 	// TokenFile is a path to a file containing the bearer token. The file
 	// is read once at startup. Alternative to Token for secret management
 	// systems (e.g. agenix) that write tokens to files.
 	TokenFile string `yaml:"token_file,omitempty"`
-
-	// -- oauth_chatgpt: ChatGPT/Codex OAuth token file with auto-refresh --
-	// File is the path to the JSON file containing {tokens: {access_token,
-	// refresh_token, id_token}, last_refresh}. Matches the layout used by
-	// `openai-oauth` (github.com/EvanZhouDev/openai-oauth).
-	File string `yaml:"file,omitempty"`
-	// Issuer is the OAuth issuer root. Defaults to https://auth.openai.com.
-	Issuer string `yaml:"issuer,omitempty"`
-	// ClientID is passed to the refresh endpoint. Defaults to the published
-	// ChatGPT Codex client id.
-	ClientID string `yaml:"client_id,omitempty"`
 }
 
 // Model binds a canonical model name to a provider and an upstream model id.
@@ -239,12 +227,8 @@ func validateAuth(providerName string, a *Auth) error {
 		if a.Token != "" && a.TokenFile != "" {
 			return fmt.Errorf("provider %q: use either auth.token or auth.token_file, not both", providerName)
 		}
-	case "oauth_chatgpt":
-		if a.File == "" {
-			return fmt.Errorf("provider %q: auth.type=oauth_chatgpt requires auth.file", providerName)
-		}
 	default:
-		return fmt.Errorf("provider %q: unknown auth.type %q (supported: bearer, oauth_chatgpt)", providerName, a.Type)
+		return fmt.Errorf("provider %q: unknown auth.type %q (supported: bearer)", providerName, a.Type)
 	}
 	return nil
 }

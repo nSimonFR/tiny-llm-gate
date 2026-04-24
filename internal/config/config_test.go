@@ -24,7 +24,6 @@ aliases:
   "gpt-4o": "gemma4:e4b"
   "text-embedding-3-small": "qwen3-embedding:8b"
   "openai/gpt-5.4": "gpt-5.4"
-drop_params: true
 `
 
 func TestParseValid(t *testing.T) {
@@ -43,9 +42,6 @@ func TestParseValid(t *testing.T) {
 	}
 	if len(c.Aliases) != 3 {
 		t.Errorf("expected 3 aliases, got %d", len(c.Aliases))
-	}
-	if !c.DropParams {
-		t.Errorf("expected drop_params true")
 	}
 }
 
@@ -82,32 +78,6 @@ models:
 	a := c.Providers["p"].EffectiveAuth()
 	if a == nil || a.Type != "bearer" || a.Token != "abc" {
 		t.Errorf("effective auth = %+v", a)
-	}
-}
-
-func TestParseAuthOAuthChatGPT(t *testing.T) {
-	c, err := Parse([]byte(`
-providers:
-  p:
-    type: openai
-    base_url: http://x
-    auth:
-      type: oauth_chatgpt
-      file: /tmp/auth.json
-      issuer: https://auth.example
-      client_id: app_x
-models:
-  m: { provider: p, upstream_model: m }
-`))
-	if err != nil {
-		t.Fatalf("unexpected: %v", err)
-	}
-	a := c.Providers["p"].EffectiveAuth()
-	if a == nil || a.Type != "oauth_chatgpt" {
-		t.Fatalf("effective auth = %+v", a)
-	}
-	if a.File != "/tmp/auth.json" || a.Issuer != "https://auth.example" || a.ClientID != "app_x" {
-		t.Errorf("oauth fields not parsed: %+v", a)
 	}
 }
 
@@ -213,15 +183,6 @@ providers:
     type: openai
     base_url: http://x
     auth: { type: bearer }
-models:
-  m: { provider: p, upstream_model: m }
-`,
-		"oauth missing file": `
-providers:
-  p:
-    type: openai
-    base_url: http://x
-    auth: { type: oauth_chatgpt }
 models:
   m: { provider: p, upstream_model: m }
 `,

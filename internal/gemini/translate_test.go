@@ -82,45 +82,6 @@ func TestChatResponseFromOpenAIRoundTrip(t *testing.T) {
 	}
 }
 
-func TestStreamChunkFromOpenAIEmitsGeminiShape(t *testing.T) {
-	in := `{"id":"abc","model":"m","choices":[{"index":0,"delta":{"content":"foo"}}]}`
-	out, err := StreamChunkFromOpenAI([]byte(in))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out == nil || len(out.Candidates) != 1 {
-		t.Fatalf("unexpected: %+v", out)
-	}
-	if out.Candidates[0].Content.Parts[0].Text != "foo" {
-		t.Errorf("text lost: %+v", out.Candidates[0])
-	}
-}
-
-func TestStreamChunkEmptyDeltaReturnsNil(t *testing.T) {
-	in := `{"choices":[{"index":0,"delta":{"role":"assistant"}}]}`
-	out, err := StreamChunkFromOpenAI([]byte(in))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out != nil {
-		t.Errorf("expected nil for role-only delta, got %+v", out)
-	}
-}
-
-func TestStreamChunkFinishOnlyPreserved(t *testing.T) {
-	in := `{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`
-	out, err := StreamChunkFromOpenAI([]byte(in))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out == nil {
-		t.Fatal("expected non-nil for finish")
-	}
-	if out.Candidates[0].FinishReason != "STOP" {
-		t.Errorf("finish not mapped: %+v", out.Candidates[0])
-	}
-}
-
 func TestEmbedContentForwardsOutputDimensionality(t *testing.T) {
 	dims := 1024
 	in := &EmbedContentRequest{
