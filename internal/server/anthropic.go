@@ -59,8 +59,15 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	// our configured credential. Accept-Encoding is forced to identity so
 	// we forward plaintext to the client (the upstream might otherwise
 	// choose gzip and we'd relay a compressed body).
+	//
+	// Also strip x-api-key: Anthropic prefers it over Authorization when
+	// both are present, so leaving a client-supplied x-api-key would defeat
+	// the auth replacement. Clients like pi-coding-agent send x-api-key by
+	// default; Claude Code uses Authorization Bearer, so this is a no-op
+	// for it.
 	copyHeaders(req.Header, r.Header)
 	req.Header.Del("Authorization")
+	req.Header.Del("x-api-key")
 	req.Header.Set("Accept-Encoding", "identity")
 	if s.anthropicAuth != nil {
 		if err := s.anthropicAuth.Apply(r.Context(), req); err != nil {
