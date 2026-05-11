@@ -183,6 +183,110 @@ internal/
 
 Once Phase 3/4 land, the server package will split into `frontends/` and `backends/`.
 
+## Setup for AI coding agents
+
+For an autonomous agent (e.g. Claude Code) picking up the repo cold. Verified
+against the current tree — no fabrication.
+
+### Toolchain, dev shell, build, test, vet
+
+Go `1.25` (`go.mod`); only runtime dep is `gopkg.in/yaml.v3`; built with
+`CGO_ENABLED=0` and `-ldflags "-s -w"`. The flake's dev shell ships `go`,
+`gopls`, `gotools`:
+
+```bash
+nix develop                                  # dev shell
+nix build && ./result/bin/tiny-llm-gate -h   # reproducible build
+go build -o tiny-llm-gate ./cmd/tiny-llm-gate   # faster Go iteration
+go test ./...                                # tests under every internal/* pkg + server
+go vet ./...                                 # always run before committing
+```
+
+CLI flags (`cmd/tiny-llm-gate/main.go`): `--config <path>` (default
+`config.yaml` in CWD) and `--version`. No implicit `/etc/...` lookup — the
+path is always explicit; the NixOS module renders `settings` to a Nix-store
+YAML and passes it.
+
+### Adding a new provider backend
+
+Provider type today is `"openai"` only — gated by the switch in
+`internal/config/config.go:validate()`. Outbound auth is pluggable via
+`internal/auth/auth.go`'s `Authenticator` interface
+(`Apply(ctx, *http.Request) error`); add a strategy by extending the
+`switch ac.Type` in `auth.Build` and implementing a new type.
+
+A non-OpenAI backend (anthropic-native, vertex, …) needs:
+
+1. A new branch in the `Provider.Type` switch in `config.go`.
+2. A backend-specific request builder where `proxyOpenAI` in
+   `internal/server/openai.go` currently hard-codes `chatPath` /
+   `embedPath` against `hop.Provider.BaseURL`.
+3. Body translation when the wire format differs from OpenAI.
+   `internal/gemini/translate.go` is the reference: it rewrites Gemini
+   requests into OpenAI shape before reusing the OpenAI proxy path.
+
+### Adding a new route
+
+Routes live in `internal/server/server.go` inside `(*Server).Handler()` —
+existing entries: `POST /v1/chat/completions`, `POST /v1/embeddings`,
+`GET /v1/models`, `GET /v1beta/models`, `POST /v1beta/models/`
+(dispatched in `routeGemini`), and conditionally `POST /v1/messages` when
+`cfg.Anthropic != nil`. MCP bridges register their own routes via
+`br.RegisterRoutes(mux)`.
+
+Add a handler method on `*Server` in the matching file (`openai.go`,
+`gemini.go`, `anthropic.go`, or a new sibling) and wire it in `Handler()`.
+Gemini's `:action` suffix isn't natively expressible in Go's `http.ServeMux`;
+the existing pattern is to register a prefix and dispatch on the suffix.
+
+### GitHub operations & commit style
+
+Hard rule for this org: every `gh` and `git push` runs as `nSimonFR-ai`,
+never `nSimonFR`. Run `gh auth switch -u nSimonFR-ai` (verify with
+`gh auth status`) before opening a PR.
+
+Conventional commits with optional scope (`feat`, `fix`, `chore`; scopes
+like `auth`, `gemini`, `oauth`, `anthropic`). From recent history:
+
+```
+feat(auth): FileBearer re-reads token_file on every request
+fix(anthropic): also strip incoming x-api-key
+chore: remove dead code (oauth_chatgpt, DropParams, ...)
+```
+
+Subjects under ~72 chars; the body explains the *why* when the diff isn't
+self-evident.
+
+### NixOS module — runtime files
+
+The flake exports `nixosModules.default` and `nixosModules.tiny-llm-gate`
+(both `nixos-module.nix`); see "Running on NixOS" above for the usage
+shape. Notable extra options: `memoryMax` (default `30M`), `goMemLimit`
+(`20MiB`), and `secretPaths` (paths added to `ReadOnlyPaths`). The unit
+runs under `DynamicUser=true`, `ProtectSystem=strict`, `PrivateTmp=true`,
+empty `CapabilityBoundingSet` — anything the binary reads at runtime must
+appear in `secretPaths` or the sandbox denies it.
+
+### claude-oauth tokens (Anthropic passthrough)
+
+When the gate fronts Anthropic's `/v1/messages` for an OAuth-authenticated
+client, the bearer token is supplied via `anthropic.auth.token_file`.
+`auth.FileBearer.Apply` re-reads the file on every request, so an external
+rotator updating the file (no service restart) is transparent. The nic-os
+deployment stores it at `/run/agenix/claude-oauth`:
+
+```nix
+services.tiny-llm-gate = {
+  enable = true;
+  package = tiny-llm-gate.packages.aarch64-linux.default;
+  secretPaths = [ "/run/agenix/claude-oauth" ];
+  settings.anthropic = {
+    upstream = "https://api.anthropic.com";
+    auth = { type = "bearer"; token_file = "/run/agenix/claude-oauth"; };
+  };
+};
+```
+
 ## License
 
 MIT (see [LICENSE](LICENSE) once added).
