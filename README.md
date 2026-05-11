@@ -4,6 +4,26 @@ A memory-conscious, OpenAI-compatible LLM gateway.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+## AI Installation Prompt
+
+> Install `tiny-llm-gate` on a generic Linux or macOS host. **Done when** `curl -sH "Authorization: Bearer <gateway-token>" http://127.0.0.1:4001/v1/models` returns a JSON object with a non-empty `data` array.
+>
+> 1. Clone: `git clone https://github.com/nSimonFR/tiny-llm-gate && cd tiny-llm-gate`
+> 2. Read first: `README.md`, `go.mod`, `cmd/tiny-llm-gate/main.go`, any `*.example.yaml` config. Toolchain is Go ≥ 1.25.
+> 3. Build (try in this order):
+>    - `nix build && cp result/bin/tiny-llm-gate ~/.local/bin/`
+>    - `go build -o ~/.local/bin/tiny-llm-gate ./cmd/tiny-llm-gate`
+>    Verify: `tiny-llm-gate --help` lists `-config` (or the equivalent flag).
+> 4. Write a `config.yaml`. At minimum it must declare:
+>    - One `auth:` entry (a bearer token clients will use against the gateway).
+>    - One `providers:` entry (Anthropic / OpenAI / Gemini). For Anthropic OAuth, set `auth_file:` to a path containing the raw bearer token; the gateway re-reads on each request.
+>    - One `routes:` entry mapping a model name to a provider.
+>    Examples live in the README or `*.example.yaml`.
+> 5. Run: `tiny-llm-gate -config config.yaml`. Default listen is `:4001`.
+> 6. Point any OpenAI-compatible client at `http://<host>:4001/v1`, using whichever token you put under `auth:`.
+> 7. NixOS hosts have a `services.tiny-llm-gate` module — see `module.nix`.
+>
+> **The gateway refuses unauthenticated requests by design.** If `auth:` is missing the daemon exits at startup, not silently — do not patch around it.
 ## Why
 
 If you self-host LLMs (Ollama, llama.cpp) on a small box and want a single endpoint that:
@@ -183,22 +203,6 @@ internal/
 
 Once Phase 3/4 land, the server package will split into `frontends/` and `backends/`.
 
-## Setup for AI coding agents
-
-> Install tiny-llm-gate on a NixOS host:
->
-> 1. Add to flake inputs: `tiny-llm-gate.url = "github:nSimonFR/tiny-llm-gate";`
-> 2. Import `inputs.tiny-llm-gate.nixosModules.tiny-llm-gate` and configure:
->    ```nix
->    services.tiny-llm-gate = {
->      enable     = true;
->      package    = inputs.tiny-llm-gate.packages.${pkgs.stdenv.hostPlatform.system}.default;
->      configFile = ./tiny-llm-gate.yaml;       # providers, routes, auth
->      secretPaths = [ "/run/agenix/<your-claude-oauth-file>" ];
->    };
->    ```
-> 3. `sudo nixos-rebuild switch --flake .#<host>` — the service listens on `:4001` with an OpenAI-compatible API (`/v1/chat/completions`, `/v1/embeddings`, …). Anthropic / Gemini providers are routed and translated transparently.
-> 4. Point your OpenAI-compatible clients at `http://<host>:4001/v1` with whichever bearer token the YAML's `auth:` block declares.
 ## License
 
 MIT (see [LICENSE](LICENSE) once added).
