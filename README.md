@@ -9,7 +9,7 @@ A memory-conscious, OpenAI-compatible LLM gateway.
 > Install `tiny-llm-gate` on a generic Linux or macOS host. **Done when** `curl -sH "Authorization: Bearer <gateway-token>" http://127.0.0.1:4001/v1/models` returns a JSON object with a non-empty `data` array.
 >
 > 1. Clone: `git clone https://github.com/nSimonFR/tiny-llm-gate && cd tiny-llm-gate`
-> 2. Read first: `README.md`, `go.mod`, `cmd/tiny-llm-gate/main.go`, any `*.example.yaml` config. Toolchain is Go ≥ 1.25.
+> 2. Read first (in this order): `SPEC.md` — the authoritative spec of the running surface, then `README.md`, `go.mod`, `cmd/tiny-llm-gate/main.go`, `testdata/example-config.yaml`. Toolchain is Go ≥ 1.25. **`SPEC.md` wins over the README where they disagree** — it was derived directly from the source.
 > 3. Build (try in this order):
 >    - `nix build && cp result/bin/tiny-llm-gate ~/.local/bin/`
 >    - `go build -o ~/.local/bin/tiny-llm-gate ./cmd/tiny-llm-gate`
