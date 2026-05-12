@@ -2,9 +2,9 @@
 
 This document specifies the `tiny-llm-gate` contract: what it does **on the
 wire** and what behaviors any implementation must preserve. It is intentionally
-language-agnostic. A rewrite of the gateway in any language must satisfy
-everything in §1–§12 to be conformant. Pointers into the current source tree
-live in the appendix (§13).
+language- and architecture-agnostic. A rewrite in any language, or split into
+any number of processes, must satisfy everything in §1–§12 to be conformant.
+Pointers into the current source tree live in the appendix (§13).
 
 Where the README diverges from this document, this document wins.
 
@@ -12,25 +12,27 @@ Where the README diverges from this document, this document wins.
 
 ## 1. Purpose
 
-`tiny-llm-gate` is a small, memory-conscious LLM gateway, built as a drop-in
-replacement for [LiteLLM] on memory-constrained hosts (Raspberry Pi 5 with
-4 GB RAM is the reference target).
+`tiny-llm-gate` is an LLM gateway that accepts requests in **OpenAI,
+Anthropic, and Gemini wire formats** and proxies — translating where necessary
+— to upstream LLM providers. Alongside the LLM surfaces, it exposes **MCP
+transport bridges** that translate one MCP transport into another.
 
-It serves three concurrent HTTP frontends in one process:
+It is designed for memory-constrained hosts (Raspberry Pi 5 with 4 GB RAM is
+the reference target) as a drop-in replacement for [LiteLLM] on small
+deployments.
 
-1. **OpenAI-compatible `/v1/...`** — primary endpoint used by clients that
-   speak OpenAI, including AFFiNE, Open WebUI, PicoClaw, and any
-   `openai`-flavoured SDK.
-2. **Anthropic-compatible `/v1/messages`** — a thin pass-through proxy used by
-   Claude Code → Aperture (the user's observability layer). The gateway does
-   not interpret the body; it strips client auth and applies its own.
+The four wire surfaces are:
+
+1. **OpenAI-compatible `/v1/...`** — used by clients that speak OpenAI
+   (AFFiNE, Open WebUI, PicoClaw, any `openai`-flavoured SDK).
+2. **Anthropic-compatible `/v1/messages`** — pass-through proxy used by Claude
+   Code → an observability layer (Aperture in the reference deployment). The
+   gateway does not interpret the body; it strips client auth and applies its
+   own.
 3. **Gemini-compatible `/v1beta/...`** — translation frontend used by
    AFFiNE's Gemini provider (text embeddings primarily, also `generateContent`
-   / `streamGenerateContent`). Requests are translated to OpenAI shape on the
-   wire to a single upstream (typically Ollama).
-
-A fourth surface exists alongside these:
-
+   / `streamGenerateContent`). Requests are translated to OpenAI shape against
+   a single upstream (typically Ollama).
 4. **MCP transport bridges** — generic SSE-frontend, StreamableHTTP-backend
    protocol bridges. Used to expose AFFiNE's StreamableHTTP MCP server as SSE
    on the tailnet for older MCP clients (this is the `/mcp/affine` route in
@@ -42,18 +44,16 @@ A fourth surface exists alongside these:
 
 ## 2. Process model
 
-- Single-process, single-binary server.
-- CLI:
-  - `-config <path>` — path to YAML config. Default `config.yaml`.
-  - `-version` — print version and exit.
-- Logging: structured JSON to **stderr**, level Info.
-- Listen address comes from `listen` in config. Default `127.0.0.1:4001`.
-- HTTP server settings: read-header timeout 10s; **no write timeout** —
+- Listens on a single HTTP listener for all four surfaces. Default
+  `127.0.0.1:4001`; configurable via the `listen` config field.
+- HTTP server tuning: read-header timeout 10s; **no write timeout** —
   streaming responses can be arbitrarily long, and a write timeout would
   truncate them.
-- Graceful shutdown on `SIGINT` / `SIGTERM`: 10-second drain, MCP-bridge
+- Structured JSON logs to standard error at Info level.
+- Graceful shutdown on `SIGINT` / `SIGTERM`: ~10-second drain, MCP-bridge
   shutdown, idle-connection close.
-- **No hot-reload.** Config changes require a full restart.
+- **No hot-reload.** Config changes require a full restart. There is no
+  SIGHUP handler.
 
 ---
 
@@ -99,7 +99,7 @@ Validation:
 - `api_key` and `auth` cannot both be set.
 - For `auth.type=bearer`: exactly one of `token` or `token_file` must be set.
 - For `token_file`: the file must be readable at startup (read once to fail
-  fast on misconfig; the runtime re-read invariant is in §6).
+  fast on misconfig; the runtime re-read invariant is in §6.2.1).
 
 When neither `api_key` nor `auth` is set, upstream requests are sent without an
 `Authorization` header.
@@ -141,8 +141,8 @@ aliases:
   "openai/gemma4:e4b": "gemma4:e4b"
 ```
 
-- Targets may themselves be aliases (chains are supported; cycles are
-  detected at resolve time — see §5.2).
+- Targets may themselves be aliases (chains are supported; **cycles MUST be
+  detected and rejected** — see §5.2).
 - At validation time, every alias target must be either a known alias or a
   known model.
 
@@ -194,8 +194,8 @@ Validation:
 
 ## 4. HTTP surface
 
-All routes are mounted on a single HTTP server. Every request passes through
-the request-ID middleware (see §7.1).
+All routes are mounted on a single HTTP server. Every request is tagged with
+a request ID (see §7.1).
 
 ### 4.1 OpenAI frontend (`/v1/...`)
 
@@ -207,8 +207,8 @@ the request-ID middleware (see §7.1).
 
 #### Request handling (`/v1/chat/completions`, `/v1/embeddings`)
 
-1. **Read body** — bounded by `maxRequestBytes = 8 MiB`.
-2. **Peek** the `model` and `stream` fields. Missing/invalid → `400`.
+1. **Read body** — bounded by **8 MiB**.
+2. **Inspect** the `model` and `stream` fields. Missing/invalid → `400`.
 3. **Resolve** the model through `aliases → models → providers`. Unknown →
    `404`.
 4. **Build chain** = `[resolved_model, fallback[0], fallback[1], ...]`.
@@ -219,17 +219,18 @@ the request-ID middleware (see §7.1).
      downstream rely on byte-stable bodies.)
    - For embedding requests, inject `dimensions` from the model's
      `default_embed_dimensions` if (a) the model has a default and (b) the
-     client didn't specify `dimensions`.
+     client did not specify `dimensions`.
    - POST to `<base_url>/chat/completions` or `<base_url>/embeddings`.
-   - Apply the provider's authenticator (see §6) — adds `Authorization: Bearer ...`.
+   - Apply the provider's outbound auth (see §6) — typically adds
+     `Authorization: Bearer ...`.
    - On upstream 5xx, if a fallback remains, drain & retry the next hop.
      **Exception**: 5xx bodies that look like wrapped 4xx client errors are
      treated as non-retryable and surfaced as 400. Detection: JSON envelope
      `error.type == "invalid_request_error"`, or `error.message` prefix
      `"Invalid '"`. (Some upstream proxies, e.g. `openai-oauth`, wrap 4xx as
      5xx; retrying makes the same call fail the same way.)
-   - On success (or non-retryable failure), copy hop-by-hop-filtered headers,
-     write status, stream/copy body.
+   - On success (or non-retryable failure), copy hop-by-hop-filtered headers
+     to the client, write status, stream/copy body.
 6. **Streaming**: when `stream: true` and upstream returned `200`, body is
    piped to the client with explicit flushes (see §4.6).
 7. **All hops failed**: respond `502` with
@@ -274,7 +275,7 @@ Claude Code uses real Anthropic model names; see invariant §11.3).
 Request flow:
 
 1. Read body bounded by 8 MiB.
-2. Peek `model` and `stream` for logging only.
+2. Inspect `model` and `stream` for logging only.
 3. Build upstream URL: `<anthropic.upstream> + <request path>` (+ raw query).
 4. Copy all client headers to the upstream request. Then:
    - **Delete `Authorization`** — the gateway replaces it.
@@ -286,7 +287,7 @@ Request flow:
      (See invariant §11.2.)
    - **Set `Accept-Encoding: identity`** — avoids the upstream sending a
      gzipped body that the gateway would have to relay compressed.
-   - Apply the configured Anthropic authenticator (see §6).
+   - Apply the configured Anthropic outbound auth (see §6).
 5. POST upstream with the original body.
 6. Copy upstream response headers (with hop-by-hop filter) and status to the
    client.
@@ -297,7 +298,7 @@ Request flow:
 
 ### 4.3 Gemini frontend (`/v1beta/...`)
 
-Gemini uses a `:action` suffix on the final URL segment. Routing splits on
+Gemini uses a `:action` suffix on the final URL segment. Routing MUST split on
 the **last** `:` so model names containing colons (`gemma4:e4b`) round-trip
 correctly.
 
@@ -351,7 +352,7 @@ to hang waiting for completion.
    - `batchEmbedContents`: array of inputs concatenated into one OpenAI call;
      `dimensions` taken from the first sub-request that sets
      `outputDimensionality`.
-4. If the request didn't specify dimensions and the model has
+4. If the request did not specify dimensions and the model has
    `default_embed_dimensions`, inject it.
 5. POST `<base_url>/embeddings` with auth.
 6. Translate response:
@@ -359,20 +360,27 @@ to hang waiting for completion.
    - `batchEmbedContents`: `{"embeddings":[{"values":[...]}, ...]}` —
      ordered by OpenAI `index` field (with bounds-check guard).
 
-Embedding requests do **not** run the fallback chain — a single attempt only.
+Embedding requests do **not** run the fallback chain — single attempt only.
 
-#### 4.3.1 Gemini wire-format coverage
+#### 4.3.1 Gemini ↔ OpenAI wire-format translation
 
 The Gemini ↔ OpenAI translator covers:
 
 - **Text content** — `Content.Parts[].Text` joined with `\n` when multiple
   parts are present.
 - **System prompt** — `systemInstruction` → OpenAI `system` message.
-- **Roles** — Gemini `"user"`/`"model"` → OpenAI `"user"`/`"assistant"`;
-  empty role defaults to `"user"`; `"system"` passes through.
+- **Role mapping**
+
+  | Gemini | OpenAI |
+  |--------|--------|
+  | `"user"` | `"user"` |
+  | `"model"` | `"assistant"` |
+  | empty | defaults to `"user"` |
+  | `"system"` | passes through |
+
 - **Generation config** — `temperature`, `topP`, `maxOutputTokens`,
-  `stopSequences` translate to OpenAI fields. `topK` is **dropped** (OpenAI
-  has no equivalent).
+  `stopSequences` translate to the corresponding OpenAI fields. `topK` is
+  **dropped** (OpenAI has no equivalent).
 - **Function calling** —
   - `tools[].functionDeclarations[]` → OpenAI `tools[].function`.
   - Gemini `functionCall` parts → OpenAI `assistant` message with
@@ -381,8 +389,8 @@ The Gemini ↔ OpenAI translator covers:
   - Gemini `functionResponse` parts → OpenAI `tool` messages with
     `tool_call_id` matched against the pending-ID queue (FIFO by function
     name). Empty `response` becomes `"{}"`.
-- **Tool-call streaming** — accumulator behavior described above.
-- **Finish reasons** —
+- **Tool-call streaming accumulation** — described above.
+- **Finish-reason mapping**
 
   | OpenAI | Gemini |
   |--------|--------|
@@ -411,8 +419,9 @@ When `mcp_bridges.<name>` is set, the bridge registers two routes per entry:
 | GET    | `<path_prefix>/sse` |
 | POST   | `<path_prefix>/message` |
 
-Transport: `sse` frontend ↔ `streamable_http` backend. Messages are
-**opaque JSON-RPC bytes** — the bridge does not parse or interpret them.
+Transport: `sse` frontend ↔ `streamable_http` backend. **Only this pairing is
+supported.** Messages are **opaque JSON-RPC bytes** — the bridge does not
+parse or interpret them.
 
 The reference deployment has one bridge named `affine` with prefix
 `/mcp/affine`, used to expose AFFiNE's MCP StreamableHTTP server as SSE on
@@ -449,11 +458,9 @@ the tailnet.
     data as one outbound message.
   - Anything else → read up to 1 MiB and forward as one message.
 - Optional bearer auth per bridge.
-- MCP bridges SHOULD use a connection pool / HTTP client configured with
-  longer timeouts than the LLM frontends — recommended bounds: idle pool
-  ~8 connections (2 per host), idle timeout 90s, response-header timeout
-  120s. HTTP/2 is not required and is disabled in the reference
-  implementation.
+- MCP bridges SHOULD use HTTP connections with longer timeouts than the LLM
+  frontends — recommended bounds: idle pool ~8 connections (2 per host),
+  idle timeout 90s, response-header timeout 120s. HTTP/2 is not required.
 - Session outbound-channel buffer: 64 messages.
 
 ### 4.5 Health & readiness
@@ -473,17 +480,16 @@ explicit non-goal (§12).
 
 All streaming responses MUST:
 
-- Use HTTP/1.1. HTTP/2 frame buffering was observed to produce stalls; the
+- Use **HTTP/1.1**. HTTP/2 frame buffering was observed to produce stalls; the
   HTTP/1.1 constraint is deliberate.
-- Flush the response writer **after every chunk** written to the client.
-  Without explicit per-chunk flushing, intermediate buffers hold output and
+- Use **chunked transfer encoding** with **per-chunk flushing** to the
+  client. Without explicit flushing, intermediate buffers hold output and
   clients see latency spikes or full hangs.
-- Use a small read buffer (4 KiB is sufficient) when piping upstream bytes
-  to the client.
+- Use a small read buffer (4 KiB is sufficient) when piping upstream bytes.
 - Preserve upstream chunk boundaries — do not coalesce.
-
-These rules apply uniformly to OpenAI SSE, Anthropic SSE pass-through,
-Gemini SSE / NDJSON, and MCP SSE.
+- Use the wire framing required by the surface: SSE (`data: <bytes>\n\n`)
+  for OpenAI, Anthropic pass-through, Gemini `?alt=sse`, and MCP; NDJSON
+  (one JSON object per line) for Gemini default streaming.
 
 ---
 
@@ -502,12 +508,12 @@ Given a client-supplied model name, resolution produces:
 
 ### 5.2 Alias chain resolution
 
-1. Walk `aliases` recursively while tracking visited names.
-2. Cycle detection: revisiting a name returns `alias cycle involving "<name>"`.
-3. Once the walk lands on a name that is **not** an alias, look it up in
-   `models`. Unknown → `unknown model "<name>"`.
-4. Validate the model's provider still exists. (Defensive — startup
-   validation also catches this, but the resolver MUST not assume it.)
+- Aliases MAY chain N levels (alias → alias → ... → model) but MUST NOT
+  cycle. Cycles MUST be detected and surfaced as a resolution error
+  (`alias cycle involving "<name>"`).
+- Once the chain lands on a name that is **not** an alias, look it up in
+  `models`. Unknown → `unknown model "<name>"`.
+- The resolved model's provider MUST exist.
 
 ### 5.3 Fallback semantics
 
@@ -520,8 +526,8 @@ Given a client-supplied model name, resolution produces:
 - Transport-level errors (DNS, connect, TLS, response-header timeout) also
   trigger a fallback hop on the OpenAI frontend. On the Gemini frontend
   they surface as `502` immediately.
-- Once **any byte** has been written to the client (status code or body),
-  no further fallback is attempted (see invariant §11.4).
+- **Once any byte has been written to the client (status code or body), no
+  further fallback is attempted** (see invariant §11.4).
 
 ### 5.4 Model list
 
@@ -550,42 +556,41 @@ or a separate reverse-proxy).
 
 ### 6.2 Outbound
 
-Two authenticator types, both setting `Authorization: Bearer <token>`:
+Two outbound bearer variants, both setting `Authorization: Bearer <token>`:
 
 **Fixed-token bearer.** Token is read from config at startup. Never re-read.
 
-**File-backed bearer.** Token is read from a file path. The path is
-validated at startup (read once to fail fast on missing/unreadable files)
-but the **token value is not cached**.
+**File-backed bearer.** Token value lives in a file. The path is validated
+at startup (read once to fail fast on missing/unreadable files).
 
-#### 6.2.1 Critical invariant: per-request token re-read
+#### 6.2.1 Critical invariant: per-request token re-read (file-backed)
 
-> **A file-backed bearer authenticator MUST re-read the token file from
-> disk on every outbound request.**
+> **A file-backed bearer MUST re-read the token file from disk on every
+> outbound request.**
 
 This invariant exists so external sidecars (e.g. `claude-remote-control`'s
-OAuth refresher) can rotate the token by writing the file, without
-restarting the gateway. **Do not introduce caching, in-memory promotion,
-fs-watching, or any other deferred read** — those all silently break
+OAuth refresher) can rotate the token by writing the file, **without
+restarting the gateway**. Do not introduce caching, in-memory promotion,
+fs-watching, or any other deferred read — those all silently break
 rotation. The invariant has been broken once already and is non-obvious to
-re-derive from a clean rewrite. It must have direct test coverage.
+re-derive from a clean rewrite. It MUST have direct test coverage.
 
 Behaviour on read failure: the request MUST fail (5xx). It MUST NOT
 silently send an empty bearer.
 
-### 6.3 Per-provider authenticator selection
+### 6.3 Per-surface auth selection
 
-Each provider has its own optional authenticator. The Anthropic frontend has
-its own dedicated authenticator (independent of the provider map). MCP
-bridges have their own per-bridge authenticators.
+Each provider has its own optional outbound bearer. The Anthropic frontend
+has its own dedicated bearer (independent of the provider map). MCP bridges
+have their own per-bridge bearers.
 
-Providers without an authenticator send no `Authorization` header upstream.
+Providers without configured auth send no `Authorization` header upstream.
 
 ### 6.4 Inbound header stripping
 
 The Anthropic handler strips both `Authorization` **and** `x-api-key` from
 the inbound request before applying the gateway's auth (§4.2, invariant
-§11.2). It also forces `Accept-Encoding: identity` so the upstream doesn't
+§11.2). It also forces `Accept-Encoding: identity` so the upstream does not
 send gzip the relay would otherwise have to decompress (or re-encode).
 
 The OpenAI and Gemini handlers construct outbound requests from scratch
@@ -599,14 +604,13 @@ on the wire.
 
 ### 7.1 Request IDs
 
-Every request passes through a request-ID middleware:
+Every request is tagged:
 
 - If `X-Request-ID` is present on the inbound request, use it.
 - Otherwise, generate a fresh ID using a cryptographically-secure RNG. The
   reference implementation uses 6 random bytes, hex-encoded (12 chars).
 - Echo the ID in the response header.
-- Propagate it through the request context so handlers can include it in
-  every log line.
+- Make the ID available to every log line emitted while serving the request.
 
 ### 7.2 Structured logging
 
@@ -662,7 +666,7 @@ The reference NixOS module exposes `services.tiny-llm-gate` with:
 | `settings` | attrset (yaml format) | `{}` | inline config; serialized to YAML |
 | `configFile` | nullable path | null | path to a YAML config (overrides `settings`) |
 | `memoryMax` | str | `"30M"` | systemd `MemoryMax=` |
-| `goMemLimit` | str | `"20MiB"` | runtime memory-limit hint env var |
+| `goMemLimit` | str | `"20MiB"` | runtime memory-limit hint env var (implementation-specific) |
 | `secretPaths` | list of str | `[]` | systemd `ReadOnlyPaths=` so the unit can read agenix secrets |
 
 The unit ships with: `DynamicUser`, `NoNewPrivileges`,
@@ -672,9 +676,8 @@ The unit ships with: `DynamicUser`, `NoNewPrivileges`,
 `SystemCallArchitectures=native`, `CapabilityBoundingSet=""`,
 `Restart=on-failure`, `RestartSec=5s`.
 
-(Some options here, e.g. `goMemLimit`, are specific to the current Go
-implementation. A rewrite in another language would replace them with
-language-equivalent memory-budget knobs.)
+A rewrite in another language would replace `goMemLimit` with whatever
+memory-budget knob that runtime exposes.
 
 ---
 
@@ -682,8 +685,8 @@ language-equivalent memory-budget knobs.)
 
 | Failure | Behaviour |
 |---------|-----------|
-| Config file missing/unparseable | exit 1 at startup with structured error |
-| `auth.token_file` unreadable at startup | exit 1 |
+| Config file missing/unparseable | exit non-zero at startup with structured error |
+| `auth.token_file` unreadable at startup | exit non-zero |
 | `auth.token_file` deleted post-startup | next request returns 5xx with read error |
 | Unknown `model` in inbound request | 404 `{"error":{"message":"unknown model ..."}}` |
 | Alias cycle | 404 (resolver error surfaces via the same path) |
@@ -716,10 +719,10 @@ These are properties any implementation MUST preserve. Each is load-bearing
 and has either been broken in the past or has non-obvious consequences if
 broken.
 
-1. **A file-backed bearer authenticator re-reads the token file on every
-   outbound request.** Caching would break OAuth-token rotation by an
-   external sidecar (`claude-remote-control`). This invariant MUST have
-   direct test coverage. See §6.2.1.
+1. **A file-backed bearer re-reads the token file on every outbound
+   request.** Caching would break OAuth-token rotation by an external
+   sidecar (`claude-remote-control`). This invariant MUST have direct test
+   coverage. See §6.2.1.
 
 2. **The Anthropic handler strips both `Authorization` *and* `x-api-key`
    from the inbound request before applying gateway auth.** Without the
@@ -739,11 +742,10 @@ broken.
 
 5. **The body rewriter preserves field order.** When the inbound `model`
    value is replaced before forwarding, the surrounding JSON document MUST
-   remain byte-stable except for the replaced value. Use a streaming /
-   token-level rewriter, **not** a parse-into-map / re-serialize approach
-   (which reorders fields by map iteration). Observability sniffers
-   downstream (Aperture) rely on byte-stable bodies for diffing and
-   replay. See §4.1.
+   remain byte-stable except for the replaced value. A parse-into-map /
+   re-serialize approach reorders fields by map iteration and is therefore
+   forbidden. Observability sniffers downstream (Aperture) rely on
+   byte-stable bodies for diffing and replay. See §4.1.
 
 6. **Config validation rejects unknown YAML fields.** Strict mode is
    mandatory — silently ignoring an unknown key has historically masked
@@ -787,37 +789,28 @@ broken.
 > implementation and is the only part of this document that is expected to
 > change under a rewrite.
 
-- **Language**: Go (CGO disabled, `-ldflags="-s -w"` stripped binary
-  ~6.5 MiB).
-- **Entrypoint**: `cmd/tiny-llm-gate/main.go`.
-- **Config schema & validation**: `internal/config/config.go`. YAML parser
-  is `gopkg.in/yaml.v3` with `KnownFields(true)` for strict mode.
-- **Authenticators**: `internal/auth/auth.go` — `Bearer{Token}` and
-  `FileBearer{Path}`. The per-request re-read invariant (§6.2.1) is
-  implemented in `FileBearer.Apply` and pinned by
-  `internal/auth/auth_test.go::TestFileBearerRereadsPerRequest`. The
-  invariant was introduced by commit `941c69a feat(auth): FileBearer
-  re-reads token_file on every request`.
-- **Routing & resolver**: `internal/resolve/resolve.go`.
-- **HTTP server wiring**: `internal/server/server.go` (mux, HTTP clients,
-  MCP bridge construction). Request-ID middleware in
-  `internal/server/middleware.go`.
-- **OpenAI frontend**: `internal/server/openai.go`. The order-preserving
-  body rewriter (§11.5) is `rewriteModelField` — a token-stream decoder,
-  not `map[string]any`.
-- **Anthropic frontend**: `internal/server/anthropic.go`. The
-  `x-api-key`-strip invariant (§11.2) was fixed in commit `81d8cd5
-  fix(anthropic): also strip incoming x-api-key`.
-- **Gemini frontend**: `internal/server/gemini.go` (dispatcher + handlers);
-  wire-format types in `internal/gemini/types.go`; translator in
-  `internal/gemini/translate.go`.
-- **MCP bridge**: `internal/mcp/bridge.go` (lifecycle), `sse.go` (SSE
-  frontend handlers), `streamhttp.go` (StreamableHTTP backend),
-  `session.go` (per-connection session state).
+- **Language**: Go (CGO disabled, stripped binary ~6.5 MiB).
+- **Entrypoint**: `cmd/tiny-llm-gate/main.go`; CLI flags `-config <path>`
+  (default `config.yaml`) and `-version`.
+- **Config & validation**: `internal/config` — strict YAML via
+  `gopkg.in/yaml.v3` with `KnownFields(true)`.
+- **Auth**: `internal/auth` — fixed and file-backed bearers; the per-request
+  re-read invariant (§6.2.1) lives here and is pinned by a dedicated test.
+- **Routing & resolver**: `internal/resolve` — alias-chain walk with cycle
+  detection.
+- **HTTP server wiring**: `internal/server` — mux, HTTP clients, MCP bridge
+  construction, request-ID middleware.
+- **OpenAI frontend**: `internal/server/openai.go` — includes the
+  order-preserving token-stream body rewriter for §11.5.
+- **Anthropic frontend**: `internal/server/anthropic.go` — pass-through
+  handler with header strip + auth swap.
+- **Gemini frontend**: `internal/server/gemini.go` (dispatcher);
+  `internal/gemini` (wire types + Gemini↔OpenAI translator).
+- **MCP bridge**: `internal/mcp` — SSE frontend, StreamableHTTP backend,
+  per-connection session state.
 - **NixOS module**: `nixos-module.nix`.
 - **Reference config**: `testdata/example-config.yaml`.
-- **Versioning**: injected at build time via Go ldflags
-  (`-X main.Version=…`). The flake derives the version from the git short
-  rev (`0.3.3-<shortRev>`, or `-dirty` / `-dev` suffixes). Current
-  development version is **0.3.3-dev**; phase status per `ROADMAP.md` is
-  **v0.3.0 features shipped, phase 5 (LiteLLM cutover) underway**.
+- **Versioning**: injected at build time; the flake derives the version
+  from the git short rev. Current development version is **0.3.3-dev**;
+  phase status per `ROADMAP.md` is **v0.3.0 features shipped, phase 5
+  (LiteLLM cutover) underway**.
