@@ -40,7 +40,15 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		// Non-streaming completions (stream:false) send NO response headers
+		// until the upstream finishes generating. A document/vision request
+		// with a large max_tokens (e.g. Reactive Resume's PDF resume parse,
+		// max_tokens 64000 to Anthropic) can legitimately take many minutes,
+		// especially under shared-OAuth rate pressure, so a tight header
+		// timeout aborts valid work. 600s gives generous headroom; DialContext
+		// still fails dead connections in 10s, so this only extends the
+		// header-wait phase (streaming requests get headers immediately).
+		ResponseHeaderTimeout: 600 * time.Second,
 		// Force HTTP/1.1 for predictable streaming and lower memory
 		// overhead than HTTP/2's frame buffering.
 		ForceAttemptHTTP2: false,
