@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/nSimonFR/tiny-llm-gate/internal/auth"
@@ -25,9 +26,14 @@ type Server struct {
 	// auths is a per-provider Authenticator, built once at startup.
 	auths   map[string]auth.Authenticator
 	bridges []*mcp.Bridge
-	// anthropicAuth is the authenticator applied to /v1/messages requests
-	// forwarded to the Anthropic API. nil when no auth is configured.
-	anthropicAuth auth.Authenticator
+	// anthropicAccounts is the pool of accounts applied to /v1/messages
+	// requests forwarded to the Anthropic API, in priority order. Empty when
+	// no auth is configured (unauthenticated passthrough).
+	anthropicAccounts []*anthropicAccount
+	// currentAnthropic is the index of the sticky "current" account. The gate
+	// stays on one account until it 429s, then advances this and stays on
+	// the new one — see pickAnthropicAccount / nextAnthropicAccount.
+	currentAnthropic atomic.Int32
 }
 
 // New builds a Server. The *http.Client has generous timeouts for streaming
@@ -88,15 +94,18 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		}
 	}
 
-	// Build the Anthropic frontend authenticator (applied to /v1/messages
-	// requests forwarded upstream).
-	var anthropicAuth auth.Authenticator
-	if cfg.Anthropic != nil && cfg.Anthropic.Auth != nil {
-		authn, err := auth.Build(authConfigFromConfig(cfg.Anthropic.Auth))
-		if err != nil {
-			return nil, fmt.Errorf("anthropic auth: %w", err)
+	// Build the Anthropic frontend account pool (applied to /v1/messages
+	// requests forwarded upstream). EffectiveAccounts folds a legacy single
+	// Auth field into a one-element slice, so this handles both shapes.
+	var anthropicAccounts []*anthropicAccount
+	if cfg.Anthropic != nil {
+		for _, ac := range cfg.Anthropic.EffectiveAccounts() {
+			authn, err := auth.Build(authConfigFromConfig(ac.Auth))
+			if err != nil {
+				return nil, fmt.Errorf("anthropic account %q: auth: %w", ac.Name, err)
+			}
+			anthropicAccounts = append(anthropicAccounts, &anthropicAccount{name: ac.Name, auth: authn})
 		}
-		anthropicAuth = authn
 	}
 
 	return &Server{
@@ -104,11 +113,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		resolver: resolve.New(cfg),
 		// No overall Timeout — streaming responses can legitimately run
 		// for minutes. Per-phase timeouts live on the Transport.
-		client:        &http.Client{Transport: transport},
-		logger:        logger,
-		auths:         auths,
-		bridges:       bridges,
-		anthropicAuth: anthropicAuth,
+		client:            &http.Client{Transport: transport},
+		logger:            logger,
+		auths:             auths,
+		bridges:           bridges,
+		anthropicAccounts: anthropicAccounts,
 	}, nil
 }
 

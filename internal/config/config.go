@@ -28,10 +28,41 @@ type Config struct {
 type Anthropic struct {
 	// Upstream is the Anthropic API root (e.g. "https://api.anthropic.com").
 	Upstream string `yaml:"upstream"`
-	// Auth configures the upstream credentials. Typically a bearer token
-	// acquired via `claude setup-token` and stored in a file managed by a
-	// secret-management system (e.g. agenix).
+	// Auth configures the upstream credentials for a single account.
+	// Typically a bearer token acquired via `claude setup-token` and stored
+	// in a file managed by a secret-management system (e.g. agenix).
+	// Mutually exclusive with Accounts.
 	Auth *Auth `yaml:"auth,omitempty"`
+	// Accounts configures two or more upstream accounts. The gate stays on
+	// one account (sticky) until it receives a 429, then fails over to the
+	// next account and stays there — see EffectiveAccounts and the server's
+	// account-selection logic. Mutually exclusive with Auth.
+	Accounts []AnthropicAccount `yaml:"accounts,omitempty"`
+}
+
+// AnthropicAccount is one credential in a multi-account Anthropic pool.
+type AnthropicAccount struct {
+	// Name identifies the account in logs (e.g. "acct1"). Must be unique
+	// within Accounts.
+	Name string `yaml:"name"`
+	Auth *Auth  `yaml:"auth"`
+}
+
+// EffectiveAccounts normalizes the Anthropic config into an ordered account
+// list, folding the legacy single Auth field into a one-element slice so
+// callers only need to handle one shape. Returns nil when unauthenticated
+// (no Auth, no Accounts) — requests are then sent without credentials.
+func (a *Anthropic) EffectiveAccounts() []AnthropicAccount {
+	if a == nil {
+		return nil
+	}
+	if len(a.Accounts) > 0 {
+		return a.Accounts
+	}
+	if a.Auth != nil {
+		return []AnthropicAccount{{Name: "default", Auth: a.Auth}}
+	}
+	return nil
 }
 
 // MCPBridge configures an MCP protocol transport bridge. It accepts
@@ -182,13 +213,40 @@ func (c *Config) validate() error {
 		return err
 	}
 	if c.Anthropic != nil {
-		if c.Anthropic.Upstream == "" {
-			return errors.New("anthropic: upstream is required")
+		if err := c.validateAnthropic(); err != nil {
+			return err
 		}
-		if c.Anthropic.Auth != nil {
-			if err := validateAuth("anthropic", c.Anthropic.Auth); err != nil {
-				return err
-			}
+	}
+	return nil
+}
+
+func (c *Config) validateAnthropic() error {
+	a := c.Anthropic
+	if a.Upstream == "" {
+		return errors.New("anthropic: upstream is required")
+	}
+	if a.Auth != nil && len(a.Accounts) > 0 {
+		return errors.New("anthropic: use either auth or accounts, not both")
+	}
+	if a.Auth != nil {
+		if err := validateAuth("anthropic", a.Auth); err != nil {
+			return err
+		}
+	}
+	seen := make(map[string]bool, len(a.Accounts))
+	for i, acct := range a.Accounts {
+		if acct.Name == "" {
+			return fmt.Errorf("anthropic: account %d: name is required", i)
+		}
+		if seen[acct.Name] {
+			return fmt.Errorf("anthropic: duplicate account name %q", acct.Name)
+		}
+		seen[acct.Name] = true
+		if acct.Auth == nil {
+			return fmt.Errorf("anthropic: account %q: auth is required", acct.Name)
+		}
+		if err := validateAuth(fmt.Sprintf("anthropic account %q", acct.Name), acct.Auth); err != nil {
+			return err
 		}
 	}
 	return nil
