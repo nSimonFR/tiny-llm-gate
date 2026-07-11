@@ -8,15 +8,98 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/nSimonFR/tiny-llm-gate/internal/auth"
 )
+
+// defaultAnthropicCooldown is used when a 429 response carries no usable
+// Retry-After header.
+const defaultAnthropicCooldown = 60 * time.Second
+
+// anthropicAccount is one credential in the Anthropic account pool, with
+// cooldown state for the sticky-until-429 failover strategy: the gate stays
+// on one account until it 429s, then moves to the next available account and
+// stays there (see pickAnthropicAccount / nextAnthropicAccount). Naive
+// round-robin was rejected — alternating every request risks rate-limiting
+// multiple accounts at once and more closely resembles ToS-gaming.
+type anthropicAccount struct {
+	name string
+	auth auth.Authenticator
+	// coolingDownUntil is a unix-seconds deadline; zero (or past) means
+	// available. Set on a 429 from this account's upstream request.
+	coolingDownUntil atomic.Int64
+}
+
+func (a *anthropicAccount) available(now time.Time) bool {
+	return a.coolingDownUntil.Load() <= now.Unix()
+}
+
+func (a *anthropicAccount) cooldown(d time.Duration) {
+	a.coolingDownUntil.Store(time.Now().Add(d).Unix())
+}
+
+// pickAnthropicAccount returns the current sticky account, skipping ahead to
+// the next available one if the current account is still cooling down.
+// Returns nil when no accounts are configured (unauthenticated passthrough).
+// If every account is cooling down, returns the current one anyway so its
+// 429 can surface to the client rather than inventing an error.
+func (s *Server) pickAnthropicAccount() *anthropicAccount {
+	n := len(s.anthropicAccounts)
+	if n == 0 {
+		return nil
+	}
+	now := time.Now()
+	start := int(s.currentAnthropic.Load())
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		if s.anthropicAccounts[idx].available(now) {
+			if idx != start {
+				s.currentAnthropic.Store(int32(idx))
+			}
+			return s.anthropicAccounts[idx]
+		}
+	}
+	return s.anthropicAccounts[start]
+}
+
+// nextAnthropicAccount advances the sticky index past the current account
+// (which just 429'd) and returns the newly selected account's name, for
+// logging.
+func (s *Server) nextAnthropicAccount() string {
+	n := len(s.anthropicAccounts)
+	if n == 0 {
+		return ""
+	}
+	next := (int(s.currentAnthropic.Load()) + 1) % n
+	s.currentAnthropic.Store(int32(next))
+	return s.anthropicAccounts[next].name
+}
+
+// parseRetryAfter reads a Retry-After header value (seconds form only —
+// Anthropic sends seconds, not an HTTP-date) and falls back to
+// defaultAnthropicCooldown when absent or unparseable.
+func parseRetryAfter(v string) time.Duration {
+	if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return defaultAnthropicCooldown
+}
 
 // handleAnthropicMessages proxies POST /v1/messages to the configured
 // Anthropic upstream. The client's request body is forwarded as-is; non-auth
 // headers pass through (so anthropic-version, anthropic-beta, etc. reach
 // Anthropic unchanged), but any incoming Authorization header is stripped
 // and replaced with the gate's configured auth.
+//
+// With multiple accounts configured, a 429 from the current account cools it
+// down (for Retry-After, or defaultAnthropicCooldown) and transparently
+// retries the same request on the next available account — bounded to one
+// pass through the pool so a request can't loop forever. The retry happens
+// before any bytes are written to the client, so it's invisible to callers.
 //
 // Intended to sit behind an observability layer (e.g. Aperture) so the full
 // request and response body are logged there — tiny-llm-gate does not
@@ -48,42 +131,71 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		upstream += "?" + r.URL.RawQuery
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(body))
-	if err != nil {
-		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("build upstream request: %v", err))
-		return
+	attempts := len(s.anthropicAccounts)
+	if attempts == 0 {
+		attempts = 1 // unauthenticated passthrough — single attempt, no failover.
 	}
 
-	// Forward non-auth client headers (anthropic-version, anthropic-beta,
-	// content-type, X-Stainless-*, etc.) then overwrite Authorization with
-	// our configured credential. Accept-Encoding is forced to identity so
-	// we forward plaintext to the client (the upstream might otherwise
-	// choose gzip and we'd relay a compressed body).
-	//
-	// Also strip x-api-key: Anthropic prefers it over Authorization when
-	// both are present, so leaving a client-supplied x-api-key would defeat
-	// the auth replacement. Clients like pi-coding-agent send x-api-key by
-	// default; Claude Code uses Authorization Bearer, so this is a no-op
-	// for it.
-	copyHeaders(req.Header, r.Header)
-	req.Header.Del("Authorization")
-	req.Header.Del("x-api-key")
-	req.Header.Set("Accept-Encoding", "identity")
-	if s.anthropicAuth != nil {
-		if err := s.anthropicAuth.Apply(r.Context(), req); err != nil {
-			writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("apply anthropic auth: %v", err))
+	var resp *http.Response
+	var accountName string
+	for attempt := 0; attempt < attempts; attempt++ {
+		req, buildErr := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(body))
+		if buildErr != nil {
+			writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("build upstream request: %v", buildErr))
 			return
 		}
-	}
 
-	resp, err := s.client.Do(req)
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return // client disconnected; no response to write.
+		// Forward non-auth client headers (anthropic-version, anthropic-beta,
+		// content-type, X-Stainless-*, etc.) then overwrite Authorization with
+		// our configured credential. Accept-Encoding is forced to identity so
+		// we forward plaintext to the client (the upstream might otherwise
+		// choose gzip and we'd relay a compressed body).
+		//
+		// Also strip x-api-key: Anthropic prefers it over Authorization when
+		// both are present, so leaving a client-supplied x-api-key would defeat
+		// the auth replacement. Clients like pi-coding-agent send x-api-key by
+		// default; Claude Code uses Authorization Bearer, so this is a no-op
+		// for it.
+		copyHeaders(req.Header, r.Header)
+		req.Header.Del("Authorization")
+		req.Header.Del("x-api-key")
+		req.Header.Set("Accept-Encoding", "identity")
+
+		acct := s.pickAnthropicAccount()
+		if acct != nil {
+			accountName = acct.name
+			if err := acct.auth.Apply(r.Context(), req); err != nil {
+				writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("apply anthropic auth: %v", err))
+				return
+			}
 		}
-		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("upstream transport: %v", err))
-		s.logger.Error("anthropic: upstream", "request_id", reqID, "err", err)
-		return
+
+		var doErr error
+		resp, doErr = s.client.Do(req)
+		if doErr != nil {
+			if errors.Is(doErr, context.Canceled) {
+				return // client disconnected; no response to write.
+			}
+			writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("upstream transport: %v", doErr))
+			s.logger.Error("anthropic: upstream", "request_id", reqID, "err", doErr)
+			return
+		}
+
+		if resp.StatusCode != http.StatusTooManyRequests || acct == nil || len(s.anthropicAccounts) < 2 {
+			break
+		}
+
+		cooldown := parseRetryAfter(resp.Header.Get("Retry-After"))
+		acct.cooldown(cooldown)
+		next := s.nextAnthropicAccount()
+		s.logger.Warn("anthropic: account switch",
+			"request_id", reqID,
+			"from", acct.name,
+			"to", next,
+			"reason", "429",
+			"cooldown_s", cooldown.Seconds(),
+		)
+		resp.Body.Close()
 	}
 	defer resp.Body.Close()
 
@@ -102,6 +214,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		"request_id", reqID,
 		"frontend", "anthropic",
 		"model", peek.Model,
+		"account", accountName,
 		"stream", peek.Stream,
 		"status", resp.StatusCode,
 		"latency_ms", time.Since(started).Milliseconds(),

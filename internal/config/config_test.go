@@ -383,6 +383,137 @@ anthropic:
 	}
 }
 
+func TestParseAnthropicAccounts(t *testing.T) {
+	c, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+  accounts:
+    - name: acct1
+      auth: { type: bearer, token_file: /run/claude-oauth/token }
+    - name: acct2
+      auth: { type: bearer, token_file: /run/claude-oauth-2/token }
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(c.Anthropic.Accounts) != 2 {
+		t.Fatalf("expected 2 accounts, got %d", len(c.Anthropic.Accounts))
+	}
+	eff := c.Anthropic.EffectiveAccounts()
+	if len(eff) != 2 || eff[0].Name != "acct1" || eff[1].Name != "acct2" {
+		t.Errorf("EffectiveAccounts = %+v", eff)
+	}
+}
+
+func TestParseAnthropicRejectsAuthAndAccounts(t *testing.T) {
+	_, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+  auth: { type: bearer, token: abc }
+  accounts:
+    - name: acct1
+      auth: { type: bearer, token: abc }
+`))
+	if err == nil {
+		t.Error("expected error when both auth and accounts are set")
+	}
+}
+
+func TestParseAnthropicAccountsDuplicateName(t *testing.T) {
+	_, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+  accounts:
+    - name: acct1
+      auth: { type: bearer, token: a }
+    - name: acct1
+      auth: { type: bearer, token: b }
+`))
+	if err == nil {
+		t.Error("expected error for duplicate account name")
+	}
+}
+
+func TestParseAnthropicAccountsMissingName(t *testing.T) {
+	_, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+  accounts:
+    - auth: { type: bearer, token: a }
+`))
+	if err == nil {
+		t.Error("expected error for account missing name")
+	}
+}
+
+func TestParseAnthropicAccountsMissingAuth(t *testing.T) {
+	_, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+  accounts:
+    - name: acct1
+`))
+	if err == nil {
+		t.Error("expected error for account missing auth")
+	}
+}
+
+func TestEffectiveAccountsFoldsLegacyAuth(t *testing.T) {
+	c, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+  auth: { type: bearer, token: abc }
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	eff := c.Anthropic.EffectiveAccounts()
+	if len(eff) != 1 || eff[0].Name != "default" || eff[0].Auth.Token != "abc" {
+		t.Errorf("EffectiveAccounts = %+v", eff)
+	}
+}
+
+func TestEffectiveAccountsNilWhenUnauthenticated(t *testing.T) {
+	c, err := Parse([]byte(`
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+anthropic:
+  upstream: https://api.anthropic.com
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if eff := c.Anthropic.EffectiveAccounts(); eff != nil {
+		t.Errorf("expected nil, got %+v", eff)
+	}
+}
+
 func TestParseAnthropicAbsent(t *testing.T) {
 	c, err := Parse([]byte(validConfig))
 	if err != nil {

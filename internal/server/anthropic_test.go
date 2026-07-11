@@ -242,6 +242,130 @@ func TestAnthropicRouteNotRegisteredWithoutConfig(t *testing.T) {
 	}
 }
 
+// buildAnthropicAccountsServer builds a Server with a multi-account Anthropic
+// config, all pointed at the same test upstream (accounts differ only in
+// which bearer token they send).
+func buildAnthropicAccountsServer(t *testing.T, upstreamURL string, accounts ...config.AnthropicAccount) *Server {
+	t.Helper()
+	cfg := &config.Config{
+		Listen: "127.0.0.1:0",
+		Providers: map[string]config.Provider{
+			"stub": {Type: "openai", BaseURL: "http://localhost:1/v1"},
+		},
+		Models: map[string]config.Model{
+			"stub": {Provider: "stub", UpstreamModel: "stub"},
+		},
+		Anthropic: &config.Anthropic{
+			Upstream: upstreamURL,
+			Accounts: accounts,
+		},
+	}
+	s, err := New(cfg, discardLogger())
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	return s
+}
+
+func TestAnthropicFailoverOnRateLimit(t *testing.T) {
+	var hits []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok := r.Header.Get("Authorization")
+		hits = append(hits, tok)
+		if tok == "Bearer acct1-token" {
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(429)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"type":"message","id":"msg_1","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	s := buildAnthropicAccountsServer(t, upstream.URL,
+		config.AnthropicAccount{Name: "acct1", Auth: &config.Auth{Type: "bearer", Token: "acct1-token"}},
+		config.AnthropicAccount{Name: "acct2", Auth: &config.Auth{Type: "bearer", Token: "acct2-token"}},
+	)
+
+	rec, _ := postMessages(t, s.Handler(), map[string]any{
+		"model":      "claude-opus-4-6",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 200 {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(hits) != 2 || hits[0] != "Bearer acct1-token" || hits[1] != "Bearer acct2-token" {
+		t.Fatalf("expected failover acct1->acct2, got %v", hits)
+	}
+
+	// A second request must go straight to acct2 (sticky), not back to acct1.
+	rec2, _ := postMessages(t, s.Handler(), map[string]any{
+		"model":      "claude-opus-4-6",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi again"}},
+	})
+	if rec2.Code != 200 {
+		t.Fatalf("status = %d body=%s", rec2.Code, rec2.Body.String())
+	}
+	if len(hits) != 3 || hits[2] != "Bearer acct2-token" {
+		t.Fatalf("expected second request to stick to acct2, got %v", hits)
+	}
+}
+
+func TestAnthropicAllAccountsCoolingDownReturnsUpstream429(t *testing.T) {
+	var hitCount int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitCount++
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`))
+	}))
+	defer upstream.Close()
+
+	s := buildAnthropicAccountsServer(t, upstream.URL,
+		config.AnthropicAccount{Name: "acct1", Auth: &config.Auth{Type: "bearer", Token: "acct1-token"}},
+		config.AnthropicAccount{Name: "acct2", Auth: &config.Auth{Type: "bearer", Token: "acct2-token"}},
+	)
+
+	rec, _ := postMessages(t, s.Handler(), map[string]any{
+		"model":      "claude-opus-4-6",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 429 {
+		t.Fatalf("expected 429 when all accounts cooling down, got %d", rec.Code)
+	}
+	if hitCount != 2 {
+		t.Fatalf("expected exactly one attempt per account (2), got %d", hitCount)
+	}
+}
+
+func TestAnthropicSingleAccountRateLimitPassesThroughNoRetry(t *testing.T) {
+	var hitCount int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitCount++
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`))
+	}))
+	defer upstream.Close()
+
+	s := buildAnthropicServer(t, upstream.URL, "sk-ant-oat01-only-token")
+	rec, _ := postMessages(t, s.Handler(), map[string]any{
+		"model":      "claude-opus-4-6",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 429 {
+		t.Fatalf("expected 429 pass-through, got %d", rec.Code)
+	}
+	if hitCount != 1 {
+		t.Fatalf("expected exactly 1 upstream call (no failover target), got %d", hitCount)
+	}
+}
+
 func TestAnthropicBodyPassesThroughUnchanged(t *testing.T) {
 	// Verify we do NOT rewrite the model field or any other field in the
 	// body — unlike /v1/chat/completions which rewrites client-facing
