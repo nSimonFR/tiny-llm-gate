@@ -94,6 +94,12 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, upstreamPat
 		if upstreamPath == embedPath && hop.DefaultEmbedDimensions != nil {
 			newBody = injectDefaultDimensions(newBody, *hop.DefaultEmbedDimensions)
 		}
+		// Inject a default reasoning_effort for chat requests when the client
+		// didn't supply one — lets config force e.g. "none" to disable a
+		// hybrid-reasoning upstream's thinking.
+		if upstreamPath == chatPath && hop.ReasoningEffort != nil {
+			newBody = injectReasoningEffort(newBody, *hop.ReasoningEffort)
+		}
 		done, err := s.sendUpstream(w, r, hop, upstreamPath, newBody, peek.Stream, i < len(chain)-1)
 		if done {
 			s.logger.Info("served",
@@ -327,6 +333,26 @@ func injectDefaultDimensions(body []byte, dims int) []byte {
 	}
 	dimBytes, _ := json.Marshal(dims)
 	peek["dimensions"] = dimBytes
+	out, err := json.Marshal(peek)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// injectReasoningEffort adds "reasoning_effort" to an OpenAI chat/completions
+// request body only when the field is absent. Returns the original body
+// unchanged when it already contains a "reasoning_effort" key.
+func injectReasoningEffort(body []byte, effort string) []byte {
+	var peek map[string]json.RawMessage
+	if json.Unmarshal(body, &peek) != nil {
+		return body
+	}
+	if _, ok := peek["reasoning_effort"]; ok {
+		return body // client already set it
+	}
+	effBytes, _ := json.Marshal(effort)
+	peek["reasoning_effort"] = effBytes
 	out, err := json.Marshal(peek)
 	if err != nil {
 		return body

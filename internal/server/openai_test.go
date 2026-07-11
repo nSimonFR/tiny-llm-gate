@@ -498,6 +498,37 @@ func TestInjectDefaultDimensions(t *testing.T) {
 	}
 }
 
+func TestInjectReasoningEffort(t *testing.T) {
+	// Without reasoning_effort — should inject.
+	body := []byte(`{"model":"m","messages":[]}`)
+	got := injectReasoningEffort(body, "none")
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal(got, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	var eff string
+	if err := json.Unmarshal(parsed["reasoning_effort"], &eff); err != nil {
+		t.Fatal(err)
+	}
+	if eff != "none" {
+		t.Errorf("expected none, got %q", eff)
+	}
+
+	// With reasoning_effort already set — should not override.
+	body2 := []byte(`{"model":"m","messages":[],"reasoning_effort":"high"}`)
+	got2 := injectReasoningEffort(body2, "none")
+	var parsed2 map[string]json.RawMessage
+	if err := json.Unmarshal(got2, &parsed2); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(parsed2["reasoning_effort"], &eff); err != nil {
+		t.Fatal(err)
+	}
+	if eff != "high" {
+		t.Errorf("expected high (original), got %q", eff)
+	}
+}
+
 func makeTestJWT(expOffsetSec int64) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
 	body := base64.RawURLEncoding.EncodeToString(

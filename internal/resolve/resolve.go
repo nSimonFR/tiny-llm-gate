@@ -34,6 +34,9 @@ type Resolved struct {
 	// DefaultEmbedDimensions, when set, is the default dimension to inject
 	// into embedding requests that don't specify one.
 	DefaultEmbedDimensions *int
+	// ReasoningEffort, when set, is the default reasoning_effort to inject
+	// into chat/completions requests that don't specify one.
+	ReasoningEffort *string
 }
 
 // Resolve looks up a model by the name a client provided. Alias chains are
@@ -68,6 +71,7 @@ func (r *Resolver) Resolve(name string) (*Resolved, error) {
 		Provider:               p,
 		Fallback:               m.Fallback,
 		DefaultEmbedDimensions: m.DefaultEmbedDimensions,
+		ReasoningEffort:        m.ReasoningEffort,
 	}, nil
 }
 

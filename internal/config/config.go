@@ -89,6 +89,13 @@ type Model struct {
 	// models from returning their full native dimension when the client
 	// SDK omits the field.
 	DefaultEmbedDimensions *int `yaml:"default_embed_dimensions,omitempty"`
+	// ReasoningEffort, when set, is injected into chat/completions requests
+	// that arrive without an explicit "reasoning_effort" field. Used to force
+	// a fixed effort level on hybrid-reasoning upstreams (e.g. Ollama honors
+	// "none" to disable a Qwen model's thinking, which the /v1 endpoint
+	// otherwise ignores for the `think` field). Valid values are upstream
+	// defined (Ollama: high|medium|low|max|none).
+	ReasoningEffort *string `yaml:"reasoning_effort,omitempty"`
 }
 
 // Load reads and validates a YAML config file.
