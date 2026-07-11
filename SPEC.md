@@ -117,6 +117,8 @@ models:
       - <model-name>
     default_embed_dimensions: <int>    # optional; injected into embedding
                                        #   requests that don't specify dimensions
+    reasoning_effort: <string>         # optional; injected into chat/completions
+                                       #   requests that don't specify one
 ```
 
 Validation:
@@ -130,6 +132,14 @@ Validation:
 (e.g. `qwen3-embedding:8b`) — without it the model returns its full native
 dimension, breaking callers that expect a smaller fixed width (e.g. AFFiNE's
 pgvector column).
+
+`reasoning_effort`, when set, is injected into `POST /chat/completions` request
+bodies that lack the field (client-supplied values always win). It exists to
+pin a fixed effort level on hybrid-reasoning upstreams. In particular Ollama
+honors `reasoning_effort: "none"` on its OpenAI-compatible `/v1` endpoint to
+disable a model's thinking, whereas the native `think` field is ignored there —
+so this is the only in-band way to force no-think for a Qwen model via the
+OpenAI surface. Injection applies to the chat path only, never embeddings.
 
 ### 3.4 `aliases`
 
