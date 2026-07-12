@@ -139,6 +139,12 @@ func (s *Server) sendUpstream(
 	isStream bool,
 	canRetry bool,
 ) (done bool, err error) {
+	// Codex providers speak the ChatGPT Responses API, not OpenAI
+	// chat/completions — translate in-process instead of byte-forwarding.
+	if hop.Provider.Type == "codex" {
+		return s.sendCodex(w, r, hop, upstreamPath, body, isStream, canRetry)
+	}
+
 	// Internal upstreamPath is always the "/chat/completions" or
 	// "/embeddings" suffix. Providers set base_url accordingly — OpenAI-compat
 	// servers include the /v1, Codex-style roots don't.

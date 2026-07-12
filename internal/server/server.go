@@ -63,7 +63,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 	}
-	auths, err := buildAuthenticators(cfg)
+	auths, err := buildAuthenticators(cfg, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +100,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	var anthropicAccounts []*anthropicAccount
 	if cfg.Anthropic != nil {
 		for _, ac := range cfg.Anthropic.EffectiveAccounts() {
-			authn, err := auth.Build(authConfigFromConfig(ac.Auth))
+			authn, err := auth.Build(authConfigFromConfig(ac.Auth, logger))
 			if err != nil {
 				return nil, fmt.Errorf("anthropic account %q: auth: %w", ac.Name, err)
 			}
@@ -124,14 +124,14 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 // buildAuthenticators constructs one auth.Authenticator per provider based on
 // config. Providers without authentication get no entry — sendUpstream treats
 // missing as "send without auth header".
-func buildAuthenticators(cfg *config.Config) (map[string]auth.Authenticator, error) {
+func buildAuthenticators(cfg *config.Config, logger *slog.Logger) (map[string]auth.Authenticator, error) {
 	out := make(map[string]auth.Authenticator, len(cfg.Providers))
 	for name, p := range cfg.Providers {
 		a := p.EffectiveAuth()
 		if a == nil {
 			continue
 		}
-		authn, err := auth.Build(authConfigFromConfig(a))
+		authn, err := auth.Build(authConfigFromConfig(a, logger))
 		if err != nil {
 			return nil, fmt.Errorf("provider %q: %w", name, err)
 		}
@@ -142,8 +142,9 @@ func buildAuthenticators(cfg *config.Config) (map[string]auth.Authenticator, err
 	return out, nil
 }
 
-// authConfigFromConfig converts a config.Auth to an auth.AuthConfig.
-func authConfigFromConfig(a *config.Auth) *auth.AuthConfig {
+// authConfigFromConfig converts a config.Auth to an auth.AuthConfig. The
+// logger is used by the oauth_chatgpt strategy to log refresh events.
+func authConfigFromConfig(a *config.Auth, logger *slog.Logger) *auth.AuthConfig {
 	if a == nil {
 		return nil
 	}
@@ -151,6 +152,10 @@ func authConfigFromConfig(a *config.Auth) *auth.AuthConfig {
 		Type:      a.Type,
 		Token:     a.Token,
 		TokenFile: a.TokenFile,
+		File:      a.File,
+		Issuer:    a.Issuer,
+		ClientID:  a.ClientID,
+		Logger:    logger,
 	}
 }
 

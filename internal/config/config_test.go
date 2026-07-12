@@ -231,6 +231,15 @@ mcp_bridges:
     path_prefix: /mcp
     auth: { type: bearer, token: abc, token_file: /tmp/t }
 `,
+		"oauth_chatgpt missing file": `
+providers:
+  p:
+    type: codex
+    base_url: https://chatgpt.com/backend-api/codex
+    auth: { type: oauth_chatgpt }
+models:
+  m: { provider: p, upstream_model: m }
+`,
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -238,6 +247,31 @@ mcp_bridges:
 				t.Errorf("expected error for %q, got nil", name)
 			}
 		})
+	}
+}
+
+func TestParseCodexProvider(t *testing.T) {
+	c, err := Parse([]byte(`
+providers:
+  codex:
+    type: codex
+    base_url: https://chatgpt.com/backend-api/codex
+    auth:
+      type: oauth_chatgpt
+      file: /run/codex/creds.json
+models:
+  gpt-5.5: { provider: codex, upstream_model: gpt-5.5 }
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	p := c.Providers["codex"]
+	if p.Type != "codex" {
+		t.Errorf("type = %q", p.Type)
+	}
+	a := p.EffectiveAuth()
+	if a == nil || a.Type != "oauth_chatgpt" || a.File != "/run/codex/creds.json" {
+		t.Errorf("auth = %+v", a)
 	}
 }
 

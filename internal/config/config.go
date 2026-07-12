@@ -83,9 +83,14 @@ type MCPBridge struct {
 
 // Provider describes one upstream LLM endpoint.
 type Provider struct {
-	// Type selects the backend implementation. Currently supported: "openai".
+	// Type selects the backend implementation. Supported: "openai" (plain
+	// OpenAI-compatible), "codex" (ChatGPT/Codex Responses API — the request
+	// and response are translated to/from OpenAI shape in-process).
 	Type string `yaml:"type"`
-	// BaseURL is the upstream root (e.g. "http://host:port/v1").
+	// BaseURL is the upstream root. For "openai" this is the /v1 root
+	// (e.g. "http://host:port/v1"); for "codex" it is the Codex backend root
+	// (e.g. "https://chatgpt.com/backend-api/codex"), to which "/responses"
+	// is appended.
 	BaseURL string `yaml:"base_url"`
 	// APIKey is a shorthand for `auth: { type: bearer, token: <value> }`.
 	// Kept for backwards compatibility with simple configs. Do not set when
@@ -98,15 +103,27 @@ type Provider struct {
 
 // Auth is the upstream authentication strategy.
 type Auth struct {
-	// Type is the auth strategy. Currently supported: "bearer".
+	// Type is the auth strategy. Supported: "bearer" and "oauth_chatgpt".
 	Type string `yaml:"type"`
 
 	// Token is the bearer token value. Mutually exclusive with TokenFile.
+	// (bearer only)
 	Token string `yaml:"token,omitempty"`
 	// TokenFile is a path to a file containing the bearer token. The file
-	// is read once at startup. Alternative to Token for secret management
-	// systems (e.g. agenix) that write tokens to files.
+	// is re-read on every request so an external process can rotate it.
+	// Alternative to Token for secret-management systems (e.g. agenix).
+	// (bearer only)
 	TokenFile string `yaml:"token_file,omitempty"`
+
+	// File is the credentials file for "oauth_chatgpt" — a JSON document
+	// holding at least a refresh_token (flat, or nested under "tokens"). The
+	// gate refreshes the access token on demand against Issuer and owns the
+	// refresh lineage.
+	File string `yaml:"file,omitempty"`
+	// Issuer and ClientID override the "oauth_chatgpt" OAuth defaults. Empty
+	// uses the built-in Codex desktop values.
+	Issuer   string `yaml:"issuer,omitempty"`
+	ClientID string `yaml:"client_id,omitempty"`
 }
 
 // Model binds a canonical model name to a provider and an upstream model id.
@@ -163,8 +180,8 @@ func (c *Config) validate() error {
 		if p.Type == "" {
 			return fmt.Errorf("provider %q: type is required", name)
 		}
-		if p.Type != "openai" {
-			return fmt.Errorf("provider %q: unknown type %q (supported: openai)", name, p.Type)
+		if p.Type != "openai" && p.Type != "codex" {
+			return fmt.Errorf("provider %q: unknown type %q (supported: openai, codex)", name, p.Type)
 		}
 		if p.BaseURL == "" {
 			return fmt.Errorf("provider %q: base_url is required", name)
@@ -292,8 +309,12 @@ func validateAuth(providerName string, a *Auth) error {
 		if a.Token != "" && a.TokenFile != "" {
 			return fmt.Errorf("provider %q: use either auth.token or auth.token_file, not both", providerName)
 		}
+	case "oauth_chatgpt":
+		if a.File == "" {
+			return fmt.Errorf("provider %q: auth.type=oauth_chatgpt requires auth.file", providerName)
+		}
 	default:
-		return fmt.Errorf("provider %q: unknown auth.type %q (supported: bearer)", providerName, a.Type)
+		return fmt.Errorf("provider %q: unknown auth.type %q (supported: bearer, oauth_chatgpt)", providerName, a.Type)
 	}
 	return nil
 }
