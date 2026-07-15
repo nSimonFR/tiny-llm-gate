@@ -3,11 +3,13 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nSimonFR/tiny-llm-gate/internal/config"
 )
@@ -445,6 +447,137 @@ func TestAnthropicSingleAccountRateLimitPassesThroughNoRetry(t *testing.T) {
 	}
 	if hitCount != 1 {
 		t.Fatalf("expected exactly 1 upstream call (no failover target), got %d", hitCount)
+	}
+}
+
+func TestAnthropicCooldownMonotonic(t *testing.T) {
+	// A short cooldown must never shorten an existing longer bench — the
+	// all-cooling fallback path re-hits benched accounts, and their fresh
+	// Retry-After-less 429s would otherwise clobber a bench-until-reset.
+	var a anthropicAccount
+	far := time.Now().Add(2 * time.Hour).Unix()
+	a.cooldownUntil(far)
+	a.cooldown(60 * time.Second)
+	if got := a.coolingDownUntil.Load(); got != far {
+		t.Fatalf("short cooldown shortened the bench: got %d want %d", got, far)
+	}
+	farther := time.Now().Add(3 * time.Hour).Unix()
+	a.cooldownUntil(farther)
+	if got := a.coolingDownUntil.Load(); got != farther {
+		t.Fatalf("cooldownUntil did not extend: got %d want %d", got, farther)
+	}
+}
+
+// buildUsageUpstream serves /v1/messages (Retry-After-less 429 for acct1,
+// 200 for acct2) plus the usage endpoint with the given status/utilization.
+// Returns the server and a pointer to the Authorization header seen by the
+// usage endpoint.
+func buildUsageUpstream(t *testing.T, usageStatus int, utilization float64, resetsAt time.Time) (*httptest.Server, *string) {
+	t.Helper()
+	usageAuth := new(string)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer acct1-token" {
+			w.WriteHeader(429) // deliberately no Retry-After — the OAuth case
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"type":"message","id":"msg_1","usage":{"input_tokens":1,"output_tokens":1}}`))
+	})
+	mux.HandleFunc(usagePath, func(w http.ResponseWriter, r *http.Request) {
+		*usageAuth = r.Header.Get("Authorization")
+		if usageStatus != 200 {
+			w.WriteHeader(usageStatus)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"five_hour":{"utilization":%g,"resets_at":%q}}`,
+			utilization, resetsAt.Format(time.RFC3339))
+	})
+	return httptest.NewServer(mux), usageAuth
+}
+
+func rateLimit429(t *testing.T, upstreamURL string) *Server {
+	t.Helper()
+	return buildAnthropicAccountsServer(t, upstreamURL,
+		config.AnthropicAccount{Name: "acct1", Auth: &config.Auth{Type: "bearer", Token: "acct1-token"}},
+		config.AnthropicAccount{Name: "acct2", Auth: &config.Auth{Type: "bearer", Token: "acct2-token"}},
+	)
+}
+
+func TestAnthropicExhausted429BenchedUntilReset(t *testing.T) {
+	// A Retry-After-less 429 from an account whose usage window is spent
+	// must bench that account until the window reset, not the 60s default
+	// (which would re-select a dead account every minute for hours).
+	resetsAt := time.Now().Add(2 * time.Hour).UTC()
+	upstream, usageAuth := buildUsageUpstream(t, 200, 100.0, resetsAt)
+	defer upstream.Close()
+
+	s := rateLimit429(t, upstream.URL)
+	rec, _ := postMessages(t, s.Handler(), map[string]any{
+		"model":      "claude-opus-4-6",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 200 {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if *usageAuth != "Bearer acct1-token" {
+		t.Fatalf("usage check used wrong credential: %q", *usageAuth)
+	}
+	benched := s.anthropicAccounts[0].coolingDownUntil.Load()
+	if want := resetsAt.Truncate(time.Second).Unix(); benched != want {
+		t.Fatalf("acct1 benched until %d, want window reset %d", benched, want)
+	}
+}
+
+func TestAnthropicTransient429KeepsShortCooldown(t *testing.T) {
+	// Below the exhaustion threshold the 429 is a burst throttle — the short
+	// default cooldown is correct and must not be extended to the reset.
+	upstream, _ := buildUsageUpstream(t, 200, 40.0, time.Now().Add(2*time.Hour))
+	defer upstream.Close()
+
+	s := rateLimit429(t, upstream.URL)
+	rec, _ := postMessages(t, s.Handler(), map[string]any{
+		"model":      "claude-opus-4-6",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 200 {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	benched := s.anthropicAccounts[0].coolingDownUntil.Load()
+	if benched <= time.Now().Unix() {
+		t.Fatal("expected a short cooldown to be set")
+	}
+	if max := time.Now().Add(2 * time.Minute).Unix(); benched > max {
+		t.Fatalf("transient 429 over-benched: until %d (> now+2m %d)", benched, max)
+	}
+}
+
+func TestAnthropicUsageEndpointFailureKeepsShortCooldown(t *testing.T) {
+	// The usage lookup is best-effort: a failing endpoint must leave the
+	// short default in place, never error the client request.
+	upstream, _ := buildUsageUpstream(t, 500, 0, time.Time{})
+	defer upstream.Close()
+
+	s := rateLimit429(t, upstream.URL)
+	rec, _ := postMessages(t, s.Handler(), map[string]any{
+		"model":      "claude-opus-4-6",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 200 {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	benched := s.anthropicAccounts[0].coolingDownUntil.Load()
+	if benched <= time.Now().Unix() {
+		t.Fatal("expected the short default cooldown despite usage failure")
+	}
+	if max := time.Now().Add(2 * time.Minute).Unix(); benched > max {
+		t.Fatalf("usage failure over-benched: until %d", benched)
 	}
 }
 

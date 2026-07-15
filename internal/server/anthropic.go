@@ -26,6 +26,22 @@ const defaultAnthropicCooldown = 60 * time.Second
 // than hammering the dead account (and failing every request) in the interim.
 const authFailureCooldown = 15 * time.Minute
 
+// usagePath is Anthropic's OAuth subscription usage endpoint, relative to the
+// API root. A GET costs no tokens and answers even for exhausted accounts.
+const usagePath = "/api/oauth/usage"
+
+// exhaustedUtilization is the five-hour-window utilization at or above which
+// a Retry-After-less 429 is treated as window exhaustion (bench until the
+// window resets) rather than a transient burst throttle (keep the short
+// default cooldown). The endpoint reports whole percents; a 429 plus >=95%
+// means the window is spent.
+const exhaustedUtilization = 95.0
+
+// maxUsageBench caps how long a usage-derived bench can last, so a
+// misparsed or weekly-scale resets_at can't silently remove an account from
+// the pool for days — worst case we re-verify with one wasted 429 per cap.
+const maxUsageBench = 6 * time.Hour
+
 // anthropicAccount is one credential in the Anthropic account pool, with
 // cooldown state for the sticky-until-429 failover strategy: the gate stays
 // on one account until it 429s, then moves to the next available account and
@@ -39,14 +55,34 @@ type anthropicAccount struct {
 	// available. Set on a 429 (rate limit) or 401/403 (auth failure) from
 	// this account's upstream request.
 	coolingDownUntil atomic.Int64
+	// usageCheckInFlight serializes benchIfExhausted lookups so a burst of
+	// concurrent 429s doesn't stampede the usage endpoint.
+	usageCheckInFlight atomic.Bool
 }
 
 func (a *anthropicAccount) available(now time.Time) bool {
 	return a.coolingDownUntil.Load() <= now.Unix()
 }
 
+// cooldownUntil extends the bench monotonically: a later deadline always
+// wins, an earlier one never shortens an existing bench. Without this, the
+// all-cooling fallback path (pickAnthropicAccount returning a benched
+// account) would get a fresh Retry-After-less 429 whose 60s default clobbers
+// a correct bench-until-window-reset.
+func (a *anthropicAccount) cooldownUntil(deadline int64) {
+	for {
+		cur := a.coolingDownUntil.Load()
+		if deadline <= cur {
+			return
+		}
+		if a.coolingDownUntil.CompareAndSwap(cur, deadline) {
+			return
+		}
+	}
+}
+
 func (a *anthropicAccount) cooldown(d time.Duration) {
-	a.coolingDownUntil.Store(time.Now().Add(d).Unix())
+	a.cooldownUntil(time.Now().Add(d).Unix())
 }
 
 // pickAnthropicAccount returns the current sticky account, skipping ahead to
@@ -110,6 +146,71 @@ func failoverTrigger(resp *http.Response) (cooldown time.Duration, reason string
 	default:
 		return 0, "", false
 	}
+}
+
+// benchIfExhausted disambiguates a Retry-After-less 429. Subscription (OAuth)
+// accounts get no rate-limit headers, so such a 429 is either a transient
+// burst throttle (recovers in seconds — the 60s default is right) or an
+// exhausted usage window (recovers at resets_at, hours away — 60s means we
+// re-select a dead account every minute). The free usage endpoint tells the
+// two apart: at >= exhaustedUtilization the window is spent, so extend the
+// bench to resets_at (capped at maxUsageBench). Best-effort: any failure
+// leaves the short default in place.
+func (s *Server) benchIfExhausted(ctx context.Context, acct *anthropicAccount, reqID string) {
+	// Already hard-benched (e.g. by a previous check or a real Retry-After)
+	// — nothing to learn.
+	if acct.coolingDownUntil.Load() > time.Now().Add(2*time.Minute).Unix() {
+		return
+	}
+	if !acct.usageCheckInFlight.CompareAndSwap(false, true) {
+		return // another request is already checking this account
+	}
+	defer acct.usageCheckInFlight.Store(false)
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		strings.TrimRight(s.cfg.Anthropic.Upstream, "/")+usagePath, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	if err := acct.auth.Apply(ctx, req); err != nil {
+		return
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+	var usage struct {
+		FiveHour struct {
+			Utilization float64   `json:"utilization"`
+			ResetsAt    time.Time `json:"resets_at"`
+		} `json:"five_hour"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&usage); err != nil {
+		return
+	}
+	if usage.FiveHour.Utilization < exhaustedUtilization || usage.FiveHour.ResetsAt.IsZero() {
+		return // burst throttle, not exhaustion — the short default stands
+	}
+	deadline := usage.FiveHour.ResetsAt
+	if capAt := time.Now().Add(maxUsageBench); deadline.After(capAt) {
+		deadline = capAt
+	}
+	acct.cooldownUntil(deadline.Unix())
+	s.logger.Warn("anthropic: account window exhausted, benched until reset",
+		"request_id", reqID,
+		"account", acct.name,
+		"utilization", usage.FiveHour.Utilization,
+		"resets_at", usage.FiveHour.ResetsAt.Format(time.RFC3339),
+		"benched_until", deadline.Format(time.RFC3339),
+	)
 }
 
 // handleAnthropicMessages proxies POST /v1/messages to the configured
@@ -216,6 +317,14 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		// (this was the last attempt), keep this response so its status and
 		// body reach the client instead of being discarded into an empty body.
 		acct.cooldown(cooldown)
+		// A 429 with no Retry-After got the short default above — check
+		// whether it's actually window exhaustion and extend the bench to
+		// the window reset if so. Runs on the last attempt too: the client
+		// gets this 429 either way, but future requests shouldn't re-select
+		// a dead account every minute.
+		if reason == "429" && resp.Header.Get("Retry-After") == "" {
+			s.benchIfExhausted(r.Context(), acct, reqID)
+		}
 		if attempt == attempts-1 {
 			break
 		}
