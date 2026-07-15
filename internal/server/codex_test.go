@@ -246,3 +246,61 @@ func TestCodexProvider_FallsBackOn5xx(t *testing.T) {
 		t.Fatalf("expected fallback response, got %s", rec.Body.String())
 	}
 }
+
+// A codex provider whose oauth_chatgpt credentials file is missing/unreadable
+// must NOT be fatal: the gate still starts, other providers keep serving, a
+// codex model with a fallback degrades to it, and a codex-only model returns a
+// clean error instead of crashing the whole process at startup (which would
+// also take down the Anthropic passthrough).
+func TestCodexProvider_MissingCredsIsNonFatal(t *testing.T) {
+	ollama := newMockUpstream(200, `{"id":"x","choices":[{"message":{"content":"from-ollama"}}]}`)
+	defer ollama.Close()
+
+	s := buildServer(t,
+		map[string]config.Provider{
+			"codex":  {Type: "codex", BaseURL: "http://unused", Auth: &config.Auth{Type: "oauth_chatgpt", File: "/nonexistent/codex-creds.json", Issuer: "http://unused"}},
+			"ollama": {Type: "openai", BaseURL: ollama.URL + "/v1", APIKey: "k"},
+		},
+		map[string]config.Model{
+			"gpt-5.5": {Provider: "codex", UpstreamModel: "gpt-5.5"},
+			"gemma":   {Provider: "ollama", UpstreamModel: "gemma4:e4b"},
+			"auto":    {Provider: "codex", UpstreamModel: "gpt-5.5", Fallback: []string{"gemma"}},
+		},
+		nil,
+	)
+
+	// Startup was non-fatal and the codex provider is recorded as disabled.
+	if _, ok := s.disabled["codex"]; !ok {
+		t.Fatalf("expected codex provider disabled, disabled=%v", s.disabled)
+	}
+	if _, ok := s.auths["codex"]; ok {
+		t.Fatal("disabled provider should have no authenticator")
+	}
+
+	// A healthy provider keeps serving.
+	rec := postJSON(t, s.Handler(), "/v1/chat/completions", map[string]any{
+		"model": "gemma", "messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "from-ollama") {
+		t.Fatalf("healthy provider: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// A codex model with a fallback degrades to the fallback.
+	rec = postJSON(t, s.Handler(), "/v1/chat/completions", map[string]any{
+		"model": "auto", "messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "from-ollama") {
+		t.Fatalf("codex fallback: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// A codex-only model (no fallback) fails cleanly with the disable reason.
+	rec = postJSON(t, s.Handler(), "/v1/chat/completions", map[string]any{
+		"model": "gpt-5.5", "messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("codex-only: expected 502, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "disabled") {
+		t.Fatalf("expected disable reason in body, got %s", rec.Body.String())
+	}
+}

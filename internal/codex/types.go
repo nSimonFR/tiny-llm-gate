@@ -138,6 +138,7 @@ type codexEvent struct {
 	Type   string `json:"type"`
 	Delta  string `json:"delta"`
 	CallID string `json:"call_id"`
+	ItemID string `json:"item_id"`
 	Name   string `json:"name"`
 	Args   string `json:"arguments"`
 	Item   *struct {
@@ -162,6 +163,19 @@ type codexUsage struct {
 	OutputTokens    int `json:"output_tokens"`
 	CachedTokens    int `json:"cached_tokens"`
 	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+// argCallID returns the identifier tying a response.function_call_arguments.*
+// event to its tool accumulator. The live Codex backend keys these events by
+// item_id (the output item's id), while response.output_item.added carries
+// both that item id and the real call_id. Prefer call_id (as
+// codex-proxy/synthetic streams may send it), fall back to item_id — the
+// aggregate maps item ids to their tool via itemIDToCall.
+func (e codexEvent) argCallID() string {
+	if e.CallID != "" {
+		return e.CallID
+	}
+	return e.ItemID
 }
 
 // ── OpenAI response/chunk (outbound to the client) ───────────────

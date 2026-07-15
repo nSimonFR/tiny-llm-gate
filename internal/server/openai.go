@@ -139,6 +139,14 @@ func (s *Server) sendUpstream(
 	isStream bool,
 	canRetry bool,
 ) (done bool, err error) {
+	// A provider whose authenticator failed to build at startup is disabled,
+	// not fatal: fail this hop with the reason so the caller falls back to the
+	// next model (and, if none, returns a clear error). Checked before any
+	// dispatch so it applies to every provider type.
+	if reason, bad := s.disabled[hop.ProviderName]; bad {
+		return false, fmt.Errorf("provider %q disabled at startup: %s", hop.ProviderName, reason)
+	}
+
 	// Codex providers speak the ChatGPT Responses API, not OpenAI
 	// chat/completions — translate in-process instead of byte-forwarding.
 	if hop.Provider.Type == "codex" {

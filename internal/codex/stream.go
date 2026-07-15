@@ -98,14 +98,14 @@ func (t *Translator) Stream(dst flusher, src io.Reader) (*openAIUsage, error) {
 				t.writeChunk(dst, t.toolStartChunk(ta))
 			}
 		case "response.function_call_arguments.delta":
-			ta := agg.resolveTool(evt.CallID, "")
+			ta := agg.resolveTool(evt.argCallID(), "")
 			if ta != nil && evt.Delta != "" {
 				ta.args.WriteString(evt.Delta)
 				t.writeChunk(dst, t.toolArgsChunk(ta, evt.Delta))
 			}
 		case "response.function_call_arguments.done":
 			// Terminal for a tool call — arguments already streamed via deltas.
-			_ = agg.resolveTool(evt.CallID, evt.Name)
+			_ = agg.resolveTool(evt.argCallID(), evt.Name)
 		case "response.completed", "response.incomplete":
 			if evt.Response != nil && evt.Response.Usage != nil {
 				agg.usage = evt.Response.Usage
@@ -156,11 +156,11 @@ func (t *Translator) Collect(src io.Reader) ([]byte, error) {
 				agg.itemIDToCall[evt.Item.ID] = ta
 			}
 		case "response.function_call_arguments.delta":
-			if ta := agg.resolveTool(evt.CallID, ""); ta != nil {
+			if ta := agg.resolveTool(evt.argCallID(), ""); ta != nil {
 				ta.args.WriteString(evt.Delta)
 			}
 		case "response.function_call_arguments.done":
-			if ta := agg.resolveTool(evt.CallID, evt.Name); ta != nil && ta.args.Len() == 0 && evt.Args != "" {
+			if ta := agg.resolveTool(evt.argCallID(), evt.Name); ta != nil && ta.args.Len() == 0 && evt.Args != "" {
 				ta.args.WriteString(evt.Args)
 			}
 		case "response.completed", "response.incomplete":

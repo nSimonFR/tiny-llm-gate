@@ -86,11 +86,14 @@ func TestStream_TextAndUsage(t *testing.T) {
 }
 
 func TestStream_ToolCalls(t *testing.T) {
+	// Real Codex backend keys the argument deltas by item_id (the output
+	// item's id), NOT call_id — see the captured wire format. output_item.added
+	// carries both ids; the deltas/done carry only item_id.
 	stream := sse(
-		`{"type":"response.output_item.added","outputIndex":0,"item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"get_weather"}}`,
-		`{"type":"response.function_call_arguments.delta","call_id":"call_1","delta":"{\"city\":"}`,
-		`{"type":"response.function_call_arguments.delta","call_id":"call_1","delta":"\"Paris\"}"}`,
-		`{"type":"response.function_call_arguments.done","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Paris\"}"}`,
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":""}}`,
+		`{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"city\":"}`,
+		`{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"\"Paris\"}"}`,
+		`{"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{\"city\":\"Paris\"}"}`,
 		`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":5,"output_tokens":7}}}`,
 	)
 	tr := NewTranslator("gpt-5.5")
@@ -100,9 +103,12 @@ func TestStream_ToolCalls(t *testing.T) {
 	}
 	chunks := parseChunks(t, out.String())
 
-	var name, args, finish string
+	var id, name, args, finish string
 	for _, c := range chunks {
 		for _, tc := range c.Choices[0].Delta.ToolCalls {
+			if tc.ID != "" {
+				id = tc.ID
+			}
 			if tc.Function.Name != "" {
 				name = tc.Function.Name
 			}
@@ -111,6 +117,9 @@ func TestStream_ToolCalls(t *testing.T) {
 		if c.Choices[0].FinishReason != nil {
 			finish = *c.Choices[0].FinishReason
 		}
+	}
+	if id != "call_1" {
+		t.Fatalf("tool id = %q (want the call_id, not the item id)", id)
 	}
 	if name != "get_weather" {
 		t.Fatalf("tool name = %q", name)
@@ -167,9 +176,9 @@ func TestCollect_TextAndUsage(t *testing.T) {
 
 func TestCollect_ToolCalls(t *testing.T) {
 	stream := sse(
-		`{"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","call_id":"call_9","name":"f"}}`,
-		`{"type":"response.function_call_arguments.delta","call_id":"call_9","delta":"{\"a\":1}"}`,
-		`{"type":"response.function_call_arguments.done","call_id":"call_9","name":"f","arguments":"{\"a\":1}"}`,
+		`{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_9","call_id":"call_9","name":"f","arguments":""}}`,
+		`{"type":"response.function_call_arguments.delta","item_id":"fc_9","delta":"{\"a\":1}"}`,
+		`{"type":"response.function_call_arguments.done","item_id":"fc_9","arguments":"{\"a\":1}"}`,
 		`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":1,"output_tokens":1}}}`,
 	)
 	tr := NewTranslator("m")
@@ -199,7 +208,7 @@ func TestCollect_ToolCalls(t *testing.T) {
 func TestStream_ToolCallDeltaByItemID(t *testing.T) {
 	stream := sse(
 		`{"type":"response.output_item.added","item":{"type":"function_call","id":"item_42","call_id":"call_7","name":"g"}}`,
-		`{"type":"response.function_call_arguments.delta","call_id":"item_42","delta":"{\"x\":1}"}`,
+		`{"type":"response.function_call_arguments.delta","item_id":"item_42","delta":"{\"x\":1}"}`,
 		`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":1,"output_tokens":1}}}`,
 	)
 	tr := NewTranslator("m")

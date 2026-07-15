@@ -112,6 +112,9 @@ func (s *Server) sendGeminiChatRequest(
 	body []byte,
 	canRetry bool,
 ) (*http.Response, bool, error) {
+	if reason, bad := s.disabled[hop.ProviderName]; bad {
+		return nil, true, fmt.Errorf("provider %q disabled at startup: %s", hop.ProviderName, reason)
+	}
 	url := strings.TrimRight(hop.Provider.BaseURL, "/") + chatPath
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
