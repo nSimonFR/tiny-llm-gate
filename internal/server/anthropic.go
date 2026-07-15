@@ -20,6 +20,12 @@ import (
 // Retry-After header.
 const defaultAnthropicCooldown = 60 * time.Second
 
+// authFailureCooldown is applied when an account returns 401/403 — an
+// expired/invalid token doesn't self-heal on a Retry-After timescale, so cool
+// it down long enough that the token-refresh sidecar can rotate it, rather
+// than hammering the dead account (and failing every request) in the interim.
+const authFailureCooldown = 15 * time.Minute
+
 // anthropicAccount is one credential in the Anthropic account pool, with
 // cooldown state for the sticky-until-429 failover strategy: the gate stays
 // on one account until it 429s, then moves to the next available account and
@@ -30,7 +36,8 @@ type anthropicAccount struct {
 	name string
 	auth auth.Authenticator
 	// coolingDownUntil is a unix-seconds deadline; zero (or past) means
-	// available. Set on a 429 from this account's upstream request.
+	// available. Set on a 429 (rate limit) or 401/403 (auth failure) from
+	// this account's upstream request.
 	coolingDownUntil atomic.Int64
 }
 
@@ -89,17 +96,36 @@ func parseRetryAfter(v string) time.Duration {
 	return defaultAnthropicCooldown
 }
 
+// failoverTrigger classifies an upstream response into a failover decision.
+// A 429 (rate limited) or a 401/403 (expired/invalid token) cools the current
+// account down and moves to the next one; any other status (including 2xx) is
+// returned to the client unchanged. Returns the cooldown to apply and a short
+// reason for logging; ok=false means "not a failover trigger".
+func failoverTrigger(resp *http.Response) (cooldown time.Duration, reason string, ok bool) {
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests:
+		return parseRetryAfter(resp.Header.Get("Retry-After")), "429", true
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return authFailureCooldown, "auth_error", true
+	default:
+		return 0, "", false
+	}
+}
+
 // handleAnthropicMessages proxies POST /v1/messages to the configured
 // Anthropic upstream. The client's request body is forwarded as-is; non-auth
 // headers pass through (so anthropic-version, anthropic-beta, etc. reach
 // Anthropic unchanged), but any incoming Authorization header is stripped
 // and replaced with the gate's configured auth.
 //
-// With multiple accounts configured, a 429 from the current account cools it
-// down (for Retry-After, or defaultAnthropicCooldown) and transparently
-// retries the same request on the next available account — bounded to one
-// pass through the pool so a request can't loop forever. The retry happens
-// before any bytes are written to the client, so it's invisible to callers.
+// With multiple accounts configured, a 429 (rate limit) or 401/403 (expired/
+// invalid token) from the current account cools it down — 429 for Retry-After
+// (or defaultAnthropicCooldown), auth errors for authFailureCooldown — and
+// transparently retries the same request on the next available account,
+// bounded to one pass through the pool so a request can't loop forever. The
+// retry happens before any bytes are written to the client, so it's invisible
+// to callers. A single-account gate has no failover target, so its 401/429
+// passes straight through.
 //
 // Intended to sit behind an observability layer (e.g. Aperture) so the full
 // request and response body are logged there — tiny-llm-gate does not
@@ -181,18 +207,25 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			return
 		}
 
-		if resp.StatusCode != http.StatusTooManyRequests || acct == nil || len(s.anthropicAccounts) < 2 {
+		cooldown, reason, failover := failoverTrigger(resp)
+		if !failover || acct == nil || len(s.anthropicAccounts) < 2 {
 			break
 		}
 
-		cooldown := parseRetryAfter(resp.Header.Get("Retry-After"))
+		// Cool the failing account regardless. If the pool is now exhausted
+		// (this was the last attempt), keep this response so its status and
+		// body reach the client instead of being discarded into an empty body.
 		acct.cooldown(cooldown)
+		if attempt == attempts-1 {
+			break
+		}
 		next := s.nextAnthropicAccount()
 		s.logger.Warn("anthropic: account switch",
 			"request_id", reqID,
 			"from", acct.name,
 			"to", next,
-			"reason", "429",
+			"reason", reason,
+			"status", resp.StatusCode,
 			"cooldown_s", cooldown.Seconds(),
 		)
 		resp.Body.Close()

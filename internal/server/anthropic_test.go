@@ -343,6 +343,88 @@ func TestAnthropicAllAccountsCoolingDownReturnsUpstream429(t *testing.T) {
 	}
 }
 
+func TestAnthropicFailoverOnAuthError(t *testing.T) {
+	// An expired/invalid token surfaces as 401 (not 429). The gate must treat
+	// it as a failover trigger and retry on the next account, otherwise a dead
+	// primary token wedges the whole pool (the rpi5 outage this fixes).
+	var hits []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok := r.Header.Get("Authorization")
+		hits = append(hits, tok)
+		if tok == "Bearer acct1-token" {
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has expired. Re-authenticate to continue."}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"type":"message","id":"msg_1","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	s := buildAnthropicAccountsServer(t, upstream.URL,
+		config.AnthropicAccount{Name: "acct1", Auth: &config.Auth{Type: "bearer", Token: "acct1-token"}},
+		config.AnthropicAccount{Name: "acct2", Auth: &config.Auth{Type: "bearer", Token: "acct2-token"}},
+	)
+
+	rec, _ := postMessages(t, s.Handler(), map[string]any{
+		"model":      "claude-opus-4-6",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 200 {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(hits) != 2 || hits[0] != "Bearer acct1-token" || hits[1] != "Bearer acct2-token" {
+		t.Fatalf("expected auth-error failover acct1->acct2, got %v", hits)
+	}
+
+	// The failed account is cooled down, so a second request sticks to acct2.
+	rec2, _ := postMessages(t, s.Handler(), map[string]any{
+		"model":      "claude-opus-4-6",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi again"}},
+	})
+	if rec2.Code != 200 {
+		t.Fatalf("status = %d body=%s", rec2.Code, rec2.Body.String())
+	}
+	if len(hits) != 3 || hits[2] != "Bearer acct2-token" {
+		t.Fatalf("expected second request to stick to acct2, got %v", hits)
+	}
+}
+
+func TestAnthropicAllAccountsAuthErrorReturnsUpstream401(t *testing.T) {
+	// When every account's token is dead, the gate makes exactly one attempt
+	// per account (bounded, no infinite loop) and surfaces the last 401.
+	var hitCount int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitCount++
+		w.WriteHeader(401)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"invalid token"}}`))
+	}))
+	defer upstream.Close()
+
+	s := buildAnthropicAccountsServer(t, upstream.URL,
+		config.AnthropicAccount{Name: "acct1", Auth: &config.Auth{Type: "bearer", Token: "acct1-token"}},
+		config.AnthropicAccount{Name: "acct2", Auth: &config.Auth{Type: "bearer", Token: "acct2-token"}},
+	)
+
+	rec, _ := postMessages(t, s.Handler(), map[string]any{
+		"model":      "claude-opus-4-6",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != 401 {
+		t.Fatalf("expected 401 when all accounts dead, got %d", rec.Code)
+	}
+	if hitCount != 2 {
+		t.Fatalf("expected exactly one attempt per account (2), got %d", hitCount)
+	}
+	if !strings.Contains(rec.Body.String(), "authentication_error") {
+		t.Errorf("body missing upstream error: %s", rec.Body.String())
+	}
+}
+
 func TestAnthropicSingleAccountRateLimitPassesThroughNoRetry(t *testing.T) {
 	var hitCount int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
