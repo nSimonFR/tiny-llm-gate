@@ -31,37 +31,33 @@ const (
 // client on every request).
 var codexInstallationID = randomUUID()
 
-// sendCodex handles one hop for a provider of type "codex". It translates the
-// OpenAI chat/completions body to a Codex Responses request, posts it to the
-// Codex backend with the desktop fingerprint + OAuth auth, then translates the
-// SSE response back to OpenAI shape (streaming or aggregated).
+// codexUpstream performs one hop for a "codex" provider: it translates the
+// OpenAI chat/completions body to a Codex Responses request, POSTs it with the
+// desktop fingerprint + OAuth auth, then translates the SSE back into the
+// OpenAI chat wire format — buffered for non-stream, or piped through a
+// goroutine for stream. It returns an OpenAI-shaped *http.Response per the
+// chatUpstream contract (see chat.go). Codex is chat-only; embeddings never
+// reach here.
 //
-// Return semantics match sendUpstream: done=true means bytes were committed to
-// the client (no fallback), done=false means the caller may try the next hop.
-// Only embeddings are unsupported (codex is chat-only) — that is a config
-// error and surfaces as done=false so a fallback can still serve.
-func (s *Server) sendCodex(
-	w http.ResponseWriter,
+// Disconnection: the upstream request is bound to r.Context(); a client drop
+// cancels it, the streaming goroutine's upstream Read errors, and the goroutine
+// closes both the pipe (CloseWithError) and the upstream Body — no leak.
+func (s *Server) codexUpstream(
 	r *http.Request,
 	hop *resolve.Resolved,
-	upstreamPath string,
 	body []byte,
 	isStream bool,
 	canRetry bool,
-) (done bool, err error) {
-	if upstreamPath != chatPath {
-		return false, fmt.Errorf("codex provider does not support %s", upstreamPath)
-	}
-
+) (*http.Response, bool, error) {
 	codexBody, err := codex.TranslateRequest(body, hop.UpstreamModel)
 	if err != nil {
-		return false, err
+		return nil, canRetry, fmt.Errorf("codex translate: %w", err)
 	}
 
 	url := strings.TrimRight(hop.Provider.BaseURL, "/") + "/responses"
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(codexBody))
 	if err != nil {
-		return false, fmt.Errorf("build codex request: %w", err)
+		return nil, false, fmt.Errorf("build codex request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -74,75 +70,48 @@ func (s *Server) sendCodex(
 	// Auth (oauth_chatgpt) sets Authorization + ChatGPT-Account-Id.
 	if authz, ok := s.auths[hop.ProviderName]; ok {
 		if err := authz.Apply(r.Context(), req); err != nil {
-			return false, fmt.Errorf("codex auth: %w", err)
+			return nil, false, fmt.Errorf("codex auth: %w", err)
 		}
 	}
 
-	resp, err := s.client.Do(req)
+	up, err := s.client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return true, nil
+			return nil, false, err // client disconnected
 		}
-		return false, fmt.Errorf("codex transport: %w", err)
+		return nil, true, fmt.Errorf("codex transport: %w", err)
 	}
-	defer resp.Body.Close()
 
-	// Non-2xx: surface upstream status. Retry the next hop only on 5xx when a
-	// fallback remains (same policy as the OpenAI path); 4xx is terminal.
-	if resp.StatusCode >= 500 && canRetry {
-		drain(resp.Body)
-		return false, fmt.Errorf("codex upstream status %d", resp.StatusCode)
+	// Retry the next hop only on 5xx when a fallback remains (same policy as
+	// the OpenAI path); any other non-2xx is returned for the frontend to
+	// forward verbatim (OpenAI) or reject with 502 (Gemini).
+	if up.StatusCode >= 500 && canRetry {
+		drain(up.Body)
+		up.Body.Close()
+		return nil, true, fmt.Errorf("codex upstream status %d", up.StatusCode)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Forward the upstream error body verbatim to the client.
-		copyHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-		return true, nil
+	if up.StatusCode < 200 || up.StatusCode >= 300 {
+		return up, false, nil
 	}
 
 	tr := codex.NewTranslator(hop.ModelName)
-	if isStream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(http.StatusOK)
-		fw := &flushWriter{w: w}
-		if _, err := tr.Stream(fw, resp.Body); err != nil {
-			// Bytes already partially sent; can't fall back. Best effort: the
-			// translator emits a terminal error only before writing, so a
-			// mid-stream failure just truncates. Log via caller.
-			return true, err
+
+	if !isStream {
+		out, cerr := tr.Collect(up.Body)
+		up.Body.Close()
+		if cerr != nil {
+			return nil, canRetry, fmt.Errorf("codex translate: %w", cerr)
 		}
-		return true, nil
+		return synthOpenAIResponse(false, io.NopCloser(bytes.NewReader(out))), false, nil
 	}
 
-	// Non-streaming: aggregate the SSE stream into one chat.completion JSON.
-	out, err := tr.Collect(resp.Body)
-	if err != nil {
-		if canRetry {
-			return false, err
-		}
-		writeJSONError(w, http.StatusBadGateway, err.Error())
-		return true, err
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(out)
-	return true, nil
-}
-
-// flushWriter adapts an http.ResponseWriter to codex.flusher, flushing after
-// every write so SSE chunks reach the client promptly.
-type flushWriter struct {
-	w http.ResponseWriter
-}
-
-func (f *flushWriter) Write(p []byte) (int, error) { return f.w.Write(p) }
-
-func (f *flushWriter) Flush() {
-	if fl, ok := f.w.(http.Flusher); ok {
-		fl.Flush()
-	}
+	pr, pw := io.Pipe()
+	go func() {
+		defer up.Body.Close()
+		_, serr := tr.Stream(pipeFlusher{pw}, up.Body)
+		pw.CloseWithError(serr)
+	}()
+	return synthOpenAIResponse(true, pr), false, nil
 }
 
 func randomUUID() string {

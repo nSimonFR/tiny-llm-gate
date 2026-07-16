@@ -122,14 +122,13 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, upstreamPat
 		"request_id", reqID, "client_model", peek.Model, "err", lastErr)
 }
 
-// sendUpstream executes one attempt. Returns (done=true) iff bytes have
-// already been committed to the client — in which case the caller must NOT
-// try another fallback. When done=false, err explains the failure and the
-// caller can continue to the next fallback.
+// sendUpstream executes one OpenAI-frontend attempt, writing the response to
+// w. Returns done=true iff bytes have been committed to the client (no
+// fallback); done=false with err lets the caller try the next fallback.
 //
-// canRetry indicates whether the caller would attempt another fallback on
-// failure. When canRetry is true we withhold writing ANY response header on
-// upstream-level errors, so the caller has a chance to try again.
+// Chat requests go through the provider-agnostic chatUpstream (chat.go), so
+// codex/anthropic providers are translated to/from the OpenAI wire format;
+// embeddings are an openai-only byte-forward.
 func (s *Server) sendUpstream(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -139,25 +138,54 @@ func (s *Server) sendUpstream(
 	isStream bool,
 	canRetry bool,
 ) (done bool, err error) {
-	// A provider whose authenticator failed to build at startup is disabled,
-	// not fatal: fail this hop with the reason so the caller falls back to the
-	// next model (and, if none, returns a clear error). Checked before any
-	// dispatch so it applies to every provider type.
+	if upstreamPath != chatPath {
+		return s.sendEmbeddings(w, r, hop, body, canRetry)
+	}
+
+	resp, retryable, err := s.chatUpstream(r, hop, body, isStream, canRetry)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return true, nil // client disconnected
+		}
+		if retryable {
+			return false, err
+		}
+		writeJSONError(w, http.StatusBadGateway, err.Error())
+		return true, err
+	}
+	defer resp.Body.Close()
+
+	// Commit response to client. Headers are verbatim for openai-type providers
+	// and synthesized (Content-Type/Cache-Control) for codex; non-2xx is
+	// forwarded as-is, matching prior behavior.
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if isStream && resp.StatusCode == http.StatusOK {
+		streamCopy(w, resp.Body)
+	} else {
+		_, _ = io.Copy(w, resp.Body)
+	}
+	return true, nil
+}
+
+// sendEmbeddings byte-forwards an /embeddings request. Embeddings are
+// openai-only: codex/anthropic providers don't support them, so those surface
+// a retryable error and the caller falls back to the next model.
+func (s *Server) sendEmbeddings(
+	w http.ResponseWriter,
+	r *http.Request,
+	hop *resolve.Resolved,
+	body []byte,
+	canRetry bool,
+) (done bool, err error) {
 	if reason, bad := s.disabled[hop.ProviderName]; bad {
 		return false, fmt.Errorf("provider %q disabled at startup: %s", hop.ProviderName, reason)
 	}
-
-	// Codex providers speak the ChatGPT Responses API, not OpenAI
-	// chat/completions — translate in-process instead of byte-forwarding.
-	if hop.Provider.Type == "codex" {
-		return s.sendCodex(w, r, hop, upstreamPath, body, isStream, canRetry)
+	if hop.Provider.Type != "openai" {
+		return false, fmt.Errorf("provider %q (type %q) does not support embeddings", hop.ProviderName, hop.Provider.Type)
 	}
 
-	// Internal upstreamPath is always the "/chat/completions" or
-	// "/embeddings" suffix. Providers set base_url accordingly — OpenAI-compat
-	// servers include the /v1, Codex-style roots don't.
-	url := strings.TrimRight(hop.Provider.BaseURL, "/") + upstreamPath
-
+	url := strings.TrimRight(hop.Provider.BaseURL, "/") + embedPath
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return false, fmt.Errorf("build upstream request: %w", err)
@@ -172,20 +200,12 @@ func (s *Server) sendUpstream(
 	resp, err := s.client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			// client disconnected; nothing else to do.
-			return true, nil
+			return true, nil // client disconnected
 		}
 		return false, fmt.Errorf("upstream transport: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Retryable upstream error: consume body to free the connection and
-	// bubble up so the caller tries the next fallback.
-	//
-	// Exception: some proxies (e.g. openai-oauth) wrap client errors as
-	// 500 by re-throwing in a catch-all handler. When the JSON body
-	// contains an OpenAI error with type "invalid_request_error", the
-	// error is non-retryable — pass it through instead of falling back.
 	if resp.StatusCode >= 500 && canRetry {
 		if isWrappedClientError(resp) {
 			resp.StatusCode = http.StatusBadRequest
@@ -195,15 +215,9 @@ func (s *Server) sendUpstream(
 		}
 	}
 
-	// Commit response to client.
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-
-	if isStream && resp.StatusCode == http.StatusOK {
-		streamCopy(w, resp.Body)
-	} else {
-		_, _ = io.Copy(w, resp.Body)
-	}
+	_, _ = io.Copy(w, resp.Body)
 	return true, nil
 }
 

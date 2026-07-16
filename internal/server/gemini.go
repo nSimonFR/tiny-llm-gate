@@ -3,7 +3,9 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -74,13 +76,26 @@ func (s *Server) serveGeminiChat(w http.ResponseWriter, r *http.Request, stream 
 			continue
 		}
 
-		resp, retryable, err := s.sendGeminiChatRequest(r, hop, upstreamBody, i < len(chain)-1)
+		resp, retryable, err := s.chatUpstream(r, hop, upstreamBody, stream, i < len(chain)-1)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return // client disconnected
+			}
 			lastErr = err
 			if retryable {
 				continue
 			}
 			writeJSONError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if resp.StatusCode != http.StatusOK {
+			// Non-2xx upstream: Gemini has no error-envelope translation, so
+			// surface a 502 (matching the pre-agnostic behavior) instead of
+			// feeding an error body into the response translator.
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+			resp.Body.Close()
+			writeJSONError(w, http.StatusBadGateway,
+				fmt.Sprintf("upstream status %d: %s", resp.StatusCode, truncateBytes(b, 400)))
 			return
 		}
 
@@ -102,46 +117,6 @@ func (s *Server) serveGeminiChat(w http.ResponseWriter, r *http.Request, stream 
 		return
 	}
 	writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("all upstreams failed: %v", lastErr))
-}
-
-// sendGeminiChatRequest issues one attempt, returning the upstream
-// response, whether the caller should retry on error, and the error.
-func (s *Server) sendGeminiChatRequest(
-	r *http.Request,
-	hop *resolve.Resolved,
-	body []byte,
-	canRetry bool,
-) (*http.Response, bool, error) {
-	if reason, bad := s.disabled[hop.ProviderName]; bad {
-		return nil, true, fmt.Errorf("provider %q disabled at startup: %s", hop.ProviderName, reason)
-	}
-	url := strings.TrimRight(hop.Provider.BaseURL, "/") + chatPath
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, false, fmt.Errorf("build upstream request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if authz, ok := s.auths[hop.ProviderName]; ok {
-		if err := authz.Apply(r.Context(), req); err != nil {
-			return nil, false, fmt.Errorf("auth: %w", err)
-		}
-	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, true, fmt.Errorf("upstream transport: %w", err)
-	}
-	if resp.StatusCode >= 500 && canRetry {
-		drain(resp.Body)
-		resp.Body.Close()
-		return nil, true, fmt.Errorf("upstream status %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		// Propagate non-retryable error as-is to the client.
-		defer resp.Body.Close()
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-		return nil, false, fmt.Errorf("upstream status %d: %s", resp.StatusCode, truncateBytes(b, 400))
-	}
-	return resp, false, nil
 }
 
 func (s *Server) writeGeminiNonStream(w http.ResponseWriter, resp *http.Response) {
