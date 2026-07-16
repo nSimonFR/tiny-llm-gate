@@ -180,11 +180,22 @@ func (c *Config) validate() error {
 		if p.Type == "" {
 			return fmt.Errorf("provider %q: type is required", name)
 		}
-		if p.Type != "openai" && p.Type != "codex" {
-			return fmt.Errorf("provider %q: unknown type %q (supported: openai, codex)", name, p.Type)
+		if p.Type != "openai" && p.Type != "codex" && p.Type != "anthropic" {
+			return fmt.Errorf("provider %q: unknown type %q (supported: openai, codex, anthropic)", name, p.Type)
 		}
 		if p.BaseURL == "" {
 			return fmt.Errorf("provider %q: base_url is required", name)
+		}
+		// A routable "anthropic" provider authenticates via the top-level
+		// anthropic account pool, not its own auth — require the pool and
+		// reject per-provider auth to keep the contract unambiguous.
+		if p.Type == "anthropic" {
+			if c.Anthropic == nil || (len(c.Anthropic.Accounts) == 0 && c.Anthropic.Auth == nil) {
+				return fmt.Errorf("provider %q: type anthropic requires a top-level anthropic pool (accounts/auth)", name)
+			}
+			if p.Auth != nil || p.APIKey != "" {
+				return fmt.Errorf("provider %q: type anthropic uses the shared anthropic pool; do not set auth/api_key", name)
+			}
 		}
 		if p.APIKey != "" && p.Auth != nil {
 			return fmt.Errorf("provider %q: use either api_key or auth, not both", name)

@@ -13,7 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nSimonFR/tiny-llm-gate/internal/anthropic"
 	"github.com/nSimonFR/tiny-llm-gate/internal/auth"
+	"github.com/nSimonFR/tiny-llm-gate/internal/resolve"
 )
 
 // defaultAnthropicCooldown is used when a 429 response carries no usable
@@ -258,86 +260,22 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		upstream += "?" + r.URL.RawQuery
 	}
 
-	attempts := len(s.anthropicAccounts)
-	if attempts == 0 {
-		attempts = 1 // unauthenticated passthrough — single attempt, no failover.
+	// Forward non-auth client headers (anthropic-version, anthropic-beta,
+	// content-type, X-Stainless-*, etc.); the pool then overwrites Authorization
+	// and strips x-api-key. Accept-Encoding is forced to identity so we relay a
+	// plaintext body to the client.
+	setHeaders := func(h http.Header) {
+		copyHeaders(h, r.Header)
+		h.Set("Accept-Encoding", "identity")
 	}
-
-	var resp *http.Response
-	var accountName string
-	for attempt := 0; attempt < attempts; attempt++ {
-		req, buildErr := http.NewRequestWithContext(r.Context(), http.MethodPost, upstream, bytes.NewReader(body))
-		if buildErr != nil {
-			writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("build upstream request: %v", buildErr))
-			return
+	resp, accountName, err := s.doAnthropicRequest(r.Context(), http.MethodPost, upstream, body, setHeaders, reqID)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return // client disconnected; no response to write.
 		}
-
-		// Forward non-auth client headers (anthropic-version, anthropic-beta,
-		// content-type, X-Stainless-*, etc.) then overwrite Authorization with
-		// our configured credential. Accept-Encoding is forced to identity so
-		// we forward plaintext to the client (the upstream might otherwise
-		// choose gzip and we'd relay a compressed body).
-		//
-		// Also strip x-api-key: Anthropic prefers it over Authorization when
-		// both are present, so leaving a client-supplied x-api-key would defeat
-		// the auth replacement. Clients like pi-coding-agent send x-api-key by
-		// default; Claude Code uses Authorization Bearer, so this is a no-op
-		// for it.
-		copyHeaders(req.Header, r.Header)
-		req.Header.Del("Authorization")
-		req.Header.Del("x-api-key")
-		req.Header.Set("Accept-Encoding", "identity")
-
-		acct := s.pickAnthropicAccount()
-		if acct != nil {
-			accountName = acct.name
-			if err := acct.auth.Apply(r.Context(), req); err != nil {
-				writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("apply anthropic auth: %v", err))
-				return
-			}
-		}
-
-		var doErr error
-		resp, doErr = s.client.Do(req)
-		if doErr != nil {
-			if errors.Is(doErr, context.Canceled) {
-				return // client disconnected; no response to write.
-			}
-			writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("upstream transport: %v", doErr))
-			s.logger.Error("anthropic: upstream", "request_id", reqID, "err", doErr)
-			return
-		}
-
-		cooldown, reason, failover := failoverTrigger(resp)
-		if !failover || acct == nil || len(s.anthropicAccounts) < 2 {
-			break
-		}
-
-		// Cool the failing account regardless. If the pool is now exhausted
-		// (this was the last attempt), keep this response so its status and
-		// body reach the client instead of being discarded into an empty body.
-		acct.cooldown(cooldown)
-		// A 429 with no Retry-After got the short default above — check
-		// whether it's actually window exhaustion and extend the bench to
-		// the window reset if so. Runs on the last attempt too: the client
-		// gets this 429 either way, but future requests shouldn't re-select
-		// a dead account every minute.
-		if reason == "429" && resp.Header.Get("Retry-After") == "" {
-			s.benchIfExhausted(r.Context(), acct, reqID)
-		}
-		if attempt == attempts-1 {
-			break
-		}
-		next := s.nextAnthropicAccount()
-		s.logger.Warn("anthropic: account switch",
-			"request_id", reqID,
-			"from", acct.name,
-			"to", next,
-			"reason", reason,
-			"status", resp.StatusCode,
-			"cooldown_s", cooldown.Seconds(),
-		)
-		resp.Body.Close()
+		writeJSONError(w, http.StatusBadGateway, err.Error())
+		s.logger.Error("anthropic: upstream", "request_id", reqID, "err", err)
+		return
 	}
 	defer resp.Body.Close()
 
@@ -361,4 +299,147 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		"status", resp.StatusCode,
 		"latency_ms", time.Since(started).Milliseconds(),
 	)
+}
+
+// defaultAnthropicMaxTokens is injected when a routed request carries no
+// max_tokens (required by the Messages API).
+const defaultAnthropicMaxTokens = 4096
+
+// doAnthropicRequest runs a request through the sticky-until-429 account pool,
+// rebuilding the request each attempt (fresh auth) and failing over on
+// 429/401/403. setHeaders installs the non-auth headers on each attempt; the
+// pool then overwrites Authorization and strips x-api-key. Returns the final
+// response (2xx or the last failover status), the account used, or a
+// transport/build error (caller checks context.Canceled). Caller Closes Body.
+//
+// BOTH the /v1/messages passthrough and the routable "anthropic" provider call
+// this, so they share the same pool + cooldown state (pickAnthropicAccount /
+// nextAnthropicAccount / cooldown / benchIfExhausted) and never hammer the same
+// benched account.
+func (s *Server) doAnthropicRequest(
+	ctx context.Context,
+	method, url string,
+	body []byte,
+	setHeaders func(http.Header),
+	reqID string,
+) (*http.Response, string, error) {
+	attempts := len(s.anthropicAccounts)
+	if attempts == 0 {
+		attempts = 1 // unauthenticated passthrough — single attempt, no failover.
+	}
+
+	var resp *http.Response
+	var accountName string
+	for attempt := 0; attempt < attempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, accountName, fmt.Errorf("build upstream request: %w", err)
+		}
+		setHeaders(req.Header)
+		req.Header.Del("Authorization")
+		req.Header.Del("x-api-key")
+
+		acct := s.pickAnthropicAccount()
+		if acct != nil {
+			accountName = acct.name
+			if err := acct.auth.Apply(ctx, req); err != nil {
+				return nil, accountName, fmt.Errorf("apply anthropic auth: %w", err)
+			}
+		}
+
+		var doErr error
+		resp, doErr = s.client.Do(req)
+		if doErr != nil {
+			return nil, accountName, doErr
+		}
+
+		cooldown, reason, failover := failoverTrigger(resp)
+		if !failover || acct == nil || len(s.anthropicAccounts) < 2 {
+			break
+		}
+		acct.cooldown(cooldown)
+		if reason == "429" && resp.Header.Get("Retry-After") == "" {
+			s.benchIfExhausted(ctx, acct, reqID)
+		}
+		if attempt == attempts-1 {
+			break
+		}
+		next := s.nextAnthropicAccount()
+		s.logger.Warn("anthropic: account switch",
+			"request_id", reqID,
+			"from", acct.name,
+			"to", next,
+			"reason", reason,
+			"status", resp.StatusCode,
+			"cooldown_s", cooldown.Seconds(),
+		)
+		resp.Body.Close()
+	}
+	return resp, accountName, nil
+}
+
+// anthropicUpstream performs one hop for a routable "anthropic" provider: it
+// translates the OpenAI chat body to an Anthropic Messages request, sends it
+// through the shared account pool, and translates the SSE back into the OpenAI
+// wire format (buffered non-stream, or piped stream). Returns an OpenAI-shaped
+// *http.Response per the chatUpstream contract (chat.go).
+//
+// Disconnection: same as codexUpstream — the pool request is bound to
+// r.Context(); a client drop cancels it and the streaming goroutine closes the
+// pipe + upstream Body.
+func (s *Server) anthropicUpstream(
+	r *http.Request,
+	hop *resolve.Resolved,
+	body []byte,
+	isStream bool,
+	canRetry bool,
+) (*http.Response, bool, error) {
+	upstreamBody, err := anthropic.TranslateRequest(body, hop.UpstreamModel, defaultAnthropicMaxTokens)
+	if err != nil {
+		return nil, canRetry, fmt.Errorf("anthropic translate: %w", err)
+	}
+	url := strings.TrimRight(hop.Provider.BaseURL, "/") + "/v1/messages"
+	reqID := requestID(r.Context())
+	setHeaders := func(h http.Header) {
+		h.Set("Content-Type", "application/json")
+		h.Set("Accept", "text/event-stream")
+		h.Set("anthropic-version", "2023-06-01")
+		h.Set("anthropic-beta", "oauth-2025-04-20")
+		h.Set("Accept-Encoding", "identity")
+	}
+
+	up, _, err := s.doAnthropicRequest(r.Context(), http.MethodPost, url, upstreamBody, setHeaders, reqID)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, false, err
+		}
+		return nil, true, fmt.Errorf("anthropic transport: %w", err)
+	}
+
+	if up.StatusCode >= 500 && canRetry {
+		drain(up.Body)
+		up.Body.Close()
+		return nil, true, fmt.Errorf("anthropic upstream status %d", up.StatusCode)
+	}
+	if up.StatusCode < 200 || up.StatusCode >= 300 {
+		return up, false, nil
+	}
+
+	tr := anthropic.NewTranslator(hop.ModelName)
+	if !isStream {
+		out, cerr := tr.Collect(up.Body)
+		up.Body.Close()
+		if cerr != nil {
+			return nil, canRetry, fmt.Errorf("anthropic translate: %w", cerr)
+		}
+		return synthOpenAIResponse(false, io.NopCloser(bytes.NewReader(out))), false, nil
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		defer up.Body.Close()
+		_, serr := tr.Stream(pipeFlusher{pw}, up.Body)
+		pw.CloseWithError(serr)
+	}()
+	return synthOpenAIResponse(true, pr), false, nil
 }

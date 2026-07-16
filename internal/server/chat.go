@@ -17,9 +17,11 @@ import (
 // This is the provider-agnostic "chat core": both the OpenAI and Gemini
 // frontends call it, so any provider type works behind either frontend.
 //
-//   - "openai": the REAL upstream response, verbatim (status/headers/body).
-//   - "codex":  a SYNTHETIC 200 whose Body carries translated OpenAI
+//   - "openai":    the REAL upstream response, verbatim (status/headers/body).
+//   - "codex":     a SYNTHETIC 200 whose Body carries translated OpenAI
 //     chat.completion(.chunk) bytes (JSON for non-stream, SSE for stream).
+//   - "anthropic": same as codex, translating the Anthropic Messages API via
+//     the shared account pool.
 //
 // Return contract (mirrors the old sendGeminiChatRequest so callers stay simple):
 //
@@ -54,6 +56,8 @@ func (s *Server) chatUpstream(
 	switch hop.Provider.Type {
 	case "codex":
 		return s.codexUpstream(r, hop, body, isStream, canRetry)
+	case "anthropic":
+		return s.anthropicUpstream(r, hop, body, isStream, canRetry)
 	default: // "openai" and any OpenAI-compatible upstream
 		return s.forwardOpenAIChat(r, hop, body, canRetry)
 	}
@@ -128,4 +132,4 @@ func synthOpenAIResponse(isStream bool, body io.ReadCloser) *http.Response {
 type pipeFlusher struct{ w *io.PipeWriter }
 
 func (p pipeFlusher) Write(b []byte) (int, error) { return p.w.Write(b) }
-func (p pipeFlusher) Flush()                       {}
+func (p pipeFlusher) Flush()                      {}
