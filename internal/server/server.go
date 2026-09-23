@@ -30,8 +30,14 @@ type Server struct {
 	client   *http.Client
 	logger   *slog.Logger
 	// auths is a per-provider Authenticator, built once at startup.
-	auths   map[string]auth.Authenticator
-	bridges []*mcp.Bridge
+	auths map[string]auth.Authenticator
+	// disabled maps a provider name to the reason its authenticator failed to
+	// build at startup (e.g. a missing/unreadable oauth_chatgpt credentials
+	// file). Such a provider is NOT fatal to the gate: its hops fail with this
+	// reason (and fall back), while every other provider + the Anthropic
+	// passthrough keep serving.
+	disabled map[string]string
+	bridges  []*mcp.Bridge
 	// anthropicAccounts is the pool of accounts applied to /v1/messages
 	// requests forwarded to the Anthropic API, in priority order. Empty when
 	// no auth is configured (unauthenticated passthrough).
@@ -70,7 +76,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 	}
-	auths, err := buildAuthenticators(cfg)
+	auths, disabled, err := buildAuthenticators(cfg, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -108,14 +114,14 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	anthropicRoutes := map[string]anthropicRoute{}
 	if cfg.Anthropic != nil {
 		for _, ac := range cfg.Anthropic.EffectiveAccounts() {
-			authn, err := auth.Build(authConfigFromConfig(ac.Auth))
+			authn, err := auth.Build(authConfigFromConfig(ac.Auth, logger))
 			if err != nil {
 				return nil, fmt.Errorf("anthropic account %q: auth: %w", ac.Name, err)
 			}
 			anthropicAccounts = append(anthropicAccounts, &anthropicAccount{name: ac.Name, auth: authn})
 		}
 		for model, route := range cfg.Anthropic.Routes {
-			authn, err := auth.Build(authConfigFromConfig(route.Auth))
+			authn, err := auth.Build(authConfigFromConfig(route.Auth, logger))
 			if err != nil {
 				return nil, fmt.Errorf("anthropic route %q: auth: %w", model, err)
 			}
@@ -135,6 +141,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		client:            &http.Client{Transport: transport},
 		logger:            logger,
 		auths:             auths,
+		disabled:          disabled,
 		bridges:           bridges,
 		anthropicAccounts: anthropicAccounts,
 		anthropicRoutes:   anthropicRoutes,
@@ -144,26 +151,37 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 // buildAuthenticators constructs one auth.Authenticator per provider based on
 // config. Providers without authentication get no entry — sendUpstream treats
 // missing as "send without auth header".
-func buildAuthenticators(cfg *config.Config) (map[string]auth.Authenticator, error) {
+func buildAuthenticators(cfg *config.Config, logger *slog.Logger) (map[string]auth.Authenticator, map[string]string, error) {
 	out := make(map[string]auth.Authenticator, len(cfg.Providers))
+	disabled := make(map[string]string)
 	for name, p := range cfg.Providers {
 		a := p.EffectiveAuth()
 		if a == nil {
 			continue
 		}
-		authn, err := auth.Build(authConfigFromConfig(a))
+		authn, err := auth.Build(authConfigFromConfig(a, logger))
 		if err != nil {
-			return nil, fmt.Errorf("provider %q: %w", name, err)
+			// Non-fatal: one provider's auth failing (e.g. a missing or
+			// unreadable oauth_chatgpt credentials file) must NOT take down the
+			// whole gate — and with it every other provider plus the Anthropic
+			// passthrough. Log loudly and disable just this provider; hops
+			// routed to it fail with this reason (and fall back), while the
+			// rest of the gate keeps serving.
+			logger.Error("provider auth init failed; provider disabled",
+				"provider", name, "err", err)
+			disabled[name] = err.Error()
+			continue
 		}
 		if authn != nil {
 			out[name] = authn
 		}
 	}
-	return out, nil
+	return out, disabled, nil
 }
 
-// authConfigFromConfig converts a config.Auth to an auth.AuthConfig.
-func authConfigFromConfig(a *config.Auth) *auth.AuthConfig {
+// authConfigFromConfig converts a config.Auth to an auth.AuthConfig. The
+// logger is used by the oauth_chatgpt strategy to log refresh events.
+func authConfigFromConfig(a *config.Auth, logger *slog.Logger) *auth.AuthConfig {
 	if a == nil {
 		return nil
 	}
@@ -171,6 +189,10 @@ func authConfigFromConfig(a *config.Auth) *auth.AuthConfig {
 		Type:      a.Type,
 		Token:     a.Token,
 		TokenFile: a.TokenFile,
+		File:      a.File,
+		Issuer:    a.Issuer,
+		ClientID:  a.ClientID,
+		Logger:    logger,
 	}
 }
 

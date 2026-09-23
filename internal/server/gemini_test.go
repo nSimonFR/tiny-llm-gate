@@ -13,16 +13,16 @@ import (
 
 func TestExtractGeminiModel(t *testing.T) {
 	cases := map[string]struct {
-		in    string
-		want  string
-		ok    bool
+		in   string
+		want string
+		ok   bool
 	}{
-		"simple":         {in: "/v1beta/models/gemma4:generateContent", want: "gemma4", ok: true},
-		"colons in name": {in: "/v1beta/models/gpt-5.4:streamGenerateContent", want: "gpt-5.4", ok: true},
-		"model with slash?": {in: "/v1beta/models/openai/gpt-5.4:generateContent", want: "openai/gpt-5.4", ok: true},
+		"simple":                 {in: "/v1beta/models/gemma4:generateContent", want: "gemma4", ok: true},
+		"colons in name":         {in: "/v1beta/models/gpt-5.4:streamGenerateContent", want: "gpt-5.4", ok: true},
+		"model with slash?":      {in: "/v1beta/models/openai/gpt-5.4:generateContent", want: "openai/gpt-5.4", ok: true},
 		"model with colon in id": {in: "/v1beta/models/gemma4:e4b:generateContent", want: "gemma4:e4b", ok: true},
-		"no colon":  {in: "/v1beta/models/gemma4", want: "", ok: false},
-		"wrong prefix": {in: "/foo/gemma4:x", want: "", ok: false},
+		"no colon":               {in: "/v1beta/models/gemma4", want: "", ok: false},
+		"wrong prefix":           {in: "/foo/gemma4:x", want: "", ok: false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

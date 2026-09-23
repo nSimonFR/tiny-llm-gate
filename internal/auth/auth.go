@@ -4,6 +4,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -21,6 +22,18 @@ type AuthConfig struct {
 	Type      string
 	Token     string
 	TokenFile string
+
+	// File is the credentials file for the "oauth_chatgpt" strategy — a JSON
+	// document holding at least a refresh_token (flat or nested under
+	// "tokens"). Ignored by other strategies.
+	File string
+	// Issuer and ClientID override the "oauth_chatgpt" OAuth defaults. Empty
+	// = use the built-in Codex desktop values.
+	Issuer   string
+	ClientID string
+	// Logger is used by "oauth_chatgpt" to log refresh attempts/failures.
+	// Nil falls back to slog.Default().
+	Logger *slog.Logger
 }
 
 // Build constructs an Authenticator from an AuthConfig. Returns (nil, nil) when
@@ -44,6 +57,8 @@ func Build(ac *AuthConfig) (Authenticator, error) {
 			return FileBearer{Path: ac.TokenFile}, nil
 		}
 		return Bearer{Token: ac.Token}, nil
+	case "oauth_chatgpt":
+		return NewChatGPTOAuth(ac.File, ac.Issuer, ac.ClientID, ac.Logger)
 	default:
 		return nil, fmt.Errorf("unsupported auth type %q", ac.Type)
 	}
