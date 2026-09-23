@@ -83,26 +83,39 @@ Map of provider name → upstream LLM endpoint.
 ```yaml
 providers:
   <name>:
-    type: openai          # required; currently the only supported value
+    type: openai          # required; "openai" or "codex"
     base_url: <url>       # required; e.g. http://host:port/v1
     api_key: <string>     # legacy shorthand; mutually exclusive with `auth`
     auth:                 # optional; preferred
-      type: bearer        # only supported value
-      token: <string>     # mutually exclusive with token_file
-      token_file: <path>  # mutually exclusive with token
+      type: bearer        # "bearer" or "oauth_chatgpt"
+      token: <string>     # bearer: mutually exclusive with token_file
+      token_file: <path>  # bearer: mutually exclusive with token
+      file: <path>        # oauth_chatgpt: credentials file (refresh_token)
+      issuer: <url>       # oauth_chatgpt: optional OAuth issuer override
+      client_id: <string> # oauth_chatgpt: optional client id override
 ```
 
 Validation:
 
-- `type` must be `"openai"`. Any other value rejected.
+- `type` must be `"openai"` or `"codex"`. Any other value rejected.
 - `base_url` required.
 - `api_key` and `auth` cannot both be set.
 - For `auth.type=bearer`: exactly one of `token` or `token_file` must be set.
 - For `token_file`: the file must be readable at startup (read once to fail
   fast on misconfig; the runtime re-read invariant is in §6.2.1).
+- For `auth.type=oauth_chatgpt`: `file` is required (see §6.2.2).
 
 When neither `api_key` nor `auth` is set, upstream requests are sent without an
 `Authorization` header.
+
+**`type: codex`** targets the ChatGPT/Codex Responses API
+(`POST <base_url>/responses`) instead of a plain OpenAI-compatible server. The
+gateway translates each OpenAI `/v1/chat/completions` request into a Codex
+Responses request and translates the Codex SSE response back to OpenAI chat
+shape (see §4.1.1). A codex provider participates in the same model/alias/
+fallback machinery as any other provider; it only differs in the wire
+translation and in requiring `auth.type: oauth_chatgpt`. Embeddings are not
+supported by codex providers.
 
 ### 3.3 `models`
 
@@ -250,6 +263,45 @@ Headers stripped on the upstream-response path: `Connection`, `Keep-Alive`,
 `Proxy-Authenticate`, `Proxy-Authorization`, `Te`, `Trailer`,
 `Transfer-Encoding`, `Upgrade`. All other headers are forwarded to the
 client.
+
+#### 4.1.1 Codex provider translation
+
+When a chain hop resolves to a `type: codex` provider, the hop does NOT
+byte-forward. Instead:
+
+1. The OpenAI chat body is translated to a Codex Responses request:
+   - `system`/`developer` messages are concatenated into `instructions`
+     (default `"You are a helpful assistant."` when none).
+   - Other messages become `input[]` items. Assistant `tool_calls` become
+     `{type:"function_call", call_id, name, arguments}`; `tool`/`function`
+     results become `{type:"function_call_output", call_id, output}`; user
+     content preserves images as `input_image` parts.
+   - `tools` → Codex function tools (object schemas get an injected empty
+     `properties` when missing); `tool_choice` string passes through, and
+     `{type:function, function:{name}}` flattens to `{type:function, name}`.
+   - `reasoning_effort` → `reasoning:{effort, summary:"auto"}`;
+     `response_format` → `text.format`.
+   - `stream:true` and `store:false` are always sent upstream.
+2. The request is POSTed to `<base_url>/responses` with the Codex desktop
+   fingerprint headers (`originator`, Codex Desktop `User-Agent`,
+   `x-codex-installation-id`, etc.) and the `oauth_chatgpt` auth
+   (`Authorization: Bearer` + `ChatGPT-Account-Id`).
+3. The Codex SSE response is translated back to OpenAI shape:
+   - `response.output_text.delta` → content deltas.
+   - `response.output_item.added`(function_call) + `.function_call_arguments.
+     delta`/`.done` → `tool_calls` (arguments streamed incrementally). An
+     item-id-keyed map resolves argument events that reference the output-item
+     id rather than the call_id.
+   - `response.completed` `usage` → OpenAI `usage`
+     (`input_tokens`→`prompt_tokens`, `output_tokens`→`completion_tokens`).
+   - `error`/`response.failed` → a gateway error (before any bytes are
+     written, so fallback still applies).
+   - Streaming clients receive OpenAI `chat.completion.chunk` SSE terminated
+     by `data: [DONE]`; non-streaming clients receive a single aggregated
+     `chat.completion` JSON object.
+
+Fallback semantics are unchanged: a codex hop that returns 5xx (or a transport
+error) before writing bytes falls through to the next chain entry.
 
 #### `GET /v1/models`
 
@@ -588,6 +640,29 @@ re-derive from a clean rewrite. It MUST have direct test coverage.
 Behaviour on read failure: the request MUST fail (5xx). It MUST NOT
 silently send an empty bearer.
 
+#### 6.2.2 ChatGPT OAuth (`oauth_chatgpt`)
+
+Used by `type: codex` providers. The strategy reads a credentials file — a
+JSON document holding at least a `refresh_token`, either flat
+(`{access_token, refresh_token, ...}`) or nested under `tokens` (the Codex
+CLI / openai-oauth layout) — and manages the access token itself:
+
+- On each request, if the cached access token is within ~5 minutes of expiry
+  (read from the JWT `exp` claim; a time-based passive refresh at ~55 minutes
+  is the fallback when the JWT is unreadable), it refreshes synchronously
+  against `<issuer>/oauth/token` with `grant_type=refresh_token`. Refreshes
+  are single-flighted.
+- The gateway is the **sole owner** of the refresh-token lineage — no external
+  CLI or proxy shares it — which is what prevents the mutual token-rotation
+  invalidation that a shared refresh token causes. The refreshed tokens
+  (including a rotated refresh token) are persisted back to `file` atomically.
+- `Apply` sets `Authorization: Bearer <access token>` and, when derivable from
+  the token's `https://api.openai.com/auth.chatgpt_account_id` claim,
+  `ChatGPT-Account-Id` (the Codex backend returns HTML 403 pages without it).
+- Every refresh — attempt, success, and failure — MUST be logged (a silent
+  refresh failure otherwise only surfaces as downstream 401s).
+- A missing `refresh_token` at startup is a fatal configuration error.
+
 ### 6.3 Per-surface auth selection
 
 Each provider has its own optional outbound bearer. The Anthropic frontend
@@ -806,6 +881,10 @@ broken.
   `gopkg.in/yaml.v3` with `KnownFields(true)`.
 - **Auth**: `internal/auth` — fixed and file-backed bearers; the per-request
   re-read invariant (§6.2.1) lives here and is pinned by a dedicated test.
+  The `oauth_chatgpt` strategy (§6.2.2) is `internal/auth/oauth_chatgpt.go`.
+- **Codex translation**: `internal/codex` — OpenAI↔Codex Responses request
+  and SSE-response translators (§4.1.1); the server hop lives in
+  `internal/server/codex.go`.
 - **Routing & resolver**: `internal/resolve` — alias-chain walk with cycle
   detection.
 - **HTTP server wiring**: `internal/server` — mux, HTTP clients, MCP bridge

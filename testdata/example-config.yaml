@@ -14,11 +14,15 @@ providers:
     base_url: http://100.125.240.34:11434/v1
     api_key: ollama
 
-  # Codex proxy on localhost (openai-oauth running on :4040)
+  # ChatGPT/Codex Responses API, spoken natively (no external codex-proxy).
+  # The gateway refreshes the OAuth access token itself against auth.openai.com
+  # and owns the refresh-token lineage — see SPEC §6.2.2.
   codex:
-    type: openai
-    base_url: http://127.0.0.1:4040/v1
-    api_key: unused
+    type: codex
+    base_url: https://chatgpt.com/backend-api/codex
+    auth:
+      type: oauth_chatgpt
+      file: /var/lib/tiny-llm-gate/codex-credentials.json
 
 models:
   "gemma4:e4b":
