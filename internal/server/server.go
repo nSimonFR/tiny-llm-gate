@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -41,8 +43,9 @@ type Server struct {
 	// anthropicAccounts is the pool of accounts applied to /v1/messages
 	// requests forwarded to the Anthropic API, in priority order. Empty when
 	// no auth is configured (unauthenticated passthrough).
-	anthropicAccounts []*anthropicAccount
-	anthropicRoutes   map[string]anthropicRoute
+	anthropicAccounts  []*anthropicAccount
+	anthropicRoutes    map[string]anthropicRoute
+	anthropicRouteKeys []string
 	// currentAnthropic is the index of the sticky "current" account. The gate
 	// stays on one account until it 429s, then advances this and stays on
 	// the new one — see pickAnthropicAccount / nextAnthropicAccount.
@@ -132,20 +135,38 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 			anthropicRoutes[model] = anthropicRoute{upstream: upstream, model: route.Model, auth: authn}
 		}
 	}
+	anthropicRouteKeys := make([]string, 0, len(anthropicRoutes))
+	for model := range anthropicRoutes {
+		anthropicRouteKeys = append(anthropicRouteKeys, model)
+	}
+	sort.Slice(anthropicRouteKeys, func(i, j int) bool { return len(anthropicRouteKeys[i]) > len(anthropicRouteKeys[j]) })
 
 	return &Server{
 		cfg:      cfg,
 		resolver: resolve.New(cfg),
 		// No overall Timeout — streaming responses can legitimately run
 		// for minutes. Per-phase timeouts live on the Transport.
-		client:            &http.Client{Transport: transport},
-		logger:            logger,
-		auths:             auths,
-		disabled:          disabled,
-		bridges:           bridges,
-		anthropicAccounts: anthropicAccounts,
-		anthropicRoutes:   anthropicRoutes,
+		client:             &http.Client{Transport: transport},
+		logger:             logger,
+		auths:              auths,
+		disabled:           disabled,
+		bridges:            bridges,
+		anthropicAccounts:  anthropicAccounts,
+		anthropicRoutes:    anthropicRoutes,
+		anthropicRouteKeys: anthropicRouteKeys,
 	}, nil
+}
+
+func (s *Server) matchAnthropicRoute(model string) (string, anthropicRoute, bool) {
+	if route, ok := s.anthropicRoutes[model]; ok {
+		return model, route, true
+	}
+	for _, prefix := range s.anthropicRouteKeys {
+		if strings.HasPrefix(model, prefix+"-") {
+			return prefix, s.anthropicRoutes[prefix], true
+		}
+	}
+	return "", anthropicRoute{}, false
 }
 
 // buildAuthenticators constructs one auth.Authenticator per provider based on

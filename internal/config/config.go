@@ -38,8 +38,8 @@ type Anthropic struct {
 	// next account and stays there — see EffectiveAccounts and the server's
 	// account-selection logic. Mutually exclusive with Auth.
 	Accounts []AnthropicAccount `yaml:"accounts,omitempty"`
-	// Routes override the passthrough for specific client model ids. They can
-	// rewrite the model and forward to another Messages-compatible upstream.
+	// Routes override the passthrough for client model ids. A key matches both
+	// itself and versioned variants beginning with key + "-".
 	Routes map[string]AnthropicRoute `yaml:"routes,omitempty"`
 }
 

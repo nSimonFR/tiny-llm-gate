@@ -257,7 +257,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	// Build upstream URL preserving query string (e.g. ?beta=true). A route can
 	// redirect one model id to another Messages-compatible upstream and rewrite
 	// the model before forwarding.
-	route, routed := s.anthropicRoutes[peek.Model]
+	routeName, route, routed := s.matchAnthropicRoute(peek.Model)
 	upstreamRoot := s.cfg.Anthropic.Upstream
 	if routed && route.upstream != "" {
 		upstreamRoot = route.upstream
@@ -294,7 +294,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		} else {
 			_, _ = io.Copy(w, resp.Body)
 		}
-		s.logger.Info("served", "request_id", reqID, "frontend", "anthropic", "model", peek.Model, "account", "route:"+peek.Model, "stream", peek.Stream, "status", resp.StatusCode, "latency_ms", time.Since(started).Milliseconds())
+		s.logger.Info("served", "request_id", reqID, "frontend", "anthropic", "model", peek.Model, "account", "route:"+routeName, "stream", peek.Stream, "status", resp.StatusCode, "latency_ms", time.Since(started).Milliseconds())
 		return
 	}
 
