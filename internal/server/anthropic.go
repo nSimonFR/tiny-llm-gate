@@ -252,10 +252,48 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Build upstream URL preserving query string (e.g. ?beta=true).
-	upstream := strings.TrimRight(s.cfg.Anthropic.Upstream, "/") + r.URL.Path
+	// Build upstream URL preserving query string (e.g. ?beta=true). A route can
+	// redirect one model id to another Messages-compatible upstream and rewrite
+	// the model before forwarding.
+	route, routed := s.anthropicRoutes[peek.Model]
+	upstreamRoot := s.cfg.Anthropic.Upstream
+	if routed && route.upstream != "" {
+		upstreamRoot = route.upstream
+	}
+	upstream := strings.TrimRight(upstreamRoot, "/") + r.URL.Path
 	if r.URL.RawQuery != "" {
 		upstream += "?" + r.URL.RawQuery
+	}
+	outBody := body
+	if routed && route.model != "" && route.model != peek.Model {
+		patched, err := rewriteModelField(body, route.model)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "could not rewrite anthropic model")
+			return
+		}
+		outBody = patched
+	}
+
+	if routed {
+		resp, err := s.doAnthropicRouteRequest(r.Context(), http.MethodPost, upstream, outBody, r.Header, route.auth)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			writeJSONError(w, http.StatusBadGateway, err.Error())
+			s.logger.Error("anthropic: route upstream", "request_id", reqID, "err", err)
+			return
+		}
+		defer resp.Body.Close()
+		copyHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		if peek.Stream || strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+			streamCopy(w, resp.Body)
+		} else {
+			_, _ = io.Copy(w, resp.Body)
+		}
+		s.logger.Info("served", "request_id", reqID, "frontend", "anthropic", "model", peek.Model, "account", "route:"+peek.Model, "stream", peek.Stream, "status", resp.StatusCode, "latency_ms", time.Since(started).Milliseconds())
+		return
 	}
 
 	attempts := len(s.anthropicAccounts)
@@ -361,4 +399,27 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		"status", resp.StatusCode,
 		"latency_ms", time.Since(started).Milliseconds(),
 	)
+}
+
+func (s *Server) doAnthropicRouteRequest(
+	ctx context.Context,
+	method, url string,
+	body []byte,
+	clientHeaders http.Header,
+	authn auth.Authenticator,
+) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build upstream request: %w", err)
+	}
+	copyHeaders(req.Header, clientHeaders)
+	req.Header.Del("Authorization")
+	req.Header.Del("x-api-key")
+	req.Header.Set("Accept-Encoding", "identity")
+	if authn != nil {
+		if err := authn.Apply(ctx, req); err != nil {
+			return nil, fmt.Errorf("apply anthropic route auth: %w", err)
+		}
+	}
+	return s.client.Do(req)
 }

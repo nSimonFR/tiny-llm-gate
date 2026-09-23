@@ -38,6 +38,22 @@ type Anthropic struct {
 	// next account and stays there — see EffectiveAccounts and the server's
 	// account-selection logic. Mutually exclusive with Auth.
 	Accounts []AnthropicAccount `yaml:"accounts,omitempty"`
+	// Routes override the passthrough for specific client model ids. They can
+	// rewrite the model and forward to another Messages-compatible upstream.
+	Routes map[string]AnthropicRoute `yaml:"routes,omitempty"`
+}
+
+// AnthropicRoute forwards one Anthropic model id to another Messages-compatible
+// upstream, optionally rewriting the model field and applying separate auth.
+type AnthropicRoute struct {
+	// Upstream is the API root (e.g. "https://gw.asale.ai"). When empty, the
+	// top-level Anthropic upstream is used.
+	Upstream string `yaml:"upstream,omitempty"`
+	// Model is the upstream model id to place in the request body. When empty,
+	// the client-supplied model id is forwarded unchanged.
+	Model string `yaml:"model,omitempty"`
+	// Auth configures route-specific upstream credentials. Optional.
+	Auth *Auth `yaml:"auth,omitempty"`
 }
 
 // AnthropicAccount is one credential in a multi-account Anthropic pool.
@@ -234,6 +250,16 @@ func (c *Config) validateAnthropic() error {
 	if a.Auth != nil {
 		if err := validateAuth("anthropic", a.Auth); err != nil {
 			return err
+		}
+	}
+	for model, route := range a.Routes {
+		if model == "" {
+			return errors.New("anthropic: route model id is empty")
+		}
+		if route.Auth != nil {
+			if err := validateAuth("anthropic route "+model, route.Auth); err != nil {
+				return err
+			}
 		}
 	}
 	seen := make(map[string]bool, len(a.Accounts))

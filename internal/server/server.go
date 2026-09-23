@@ -18,6 +18,12 @@ import (
 )
 
 // Server is the public type exposed to main.
+type anthropicRoute struct {
+	upstream string
+	model    string
+	auth     auth.Authenticator
+}
+
 type Server struct {
 	cfg      *config.Config
 	resolver *resolve.Resolver
@@ -30,6 +36,7 @@ type Server struct {
 	// requests forwarded to the Anthropic API, in priority order. Empty when
 	// no auth is configured (unauthenticated passthrough).
 	anthropicAccounts []*anthropicAccount
+	anthropicRoutes   map[string]anthropicRoute
 	// currentAnthropic is the index of the sticky "current" account. The gate
 	// stays on one account until it 429s, then advances this and stays on
 	// the new one — see pickAnthropicAccount / nextAnthropicAccount.
@@ -98,6 +105,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	// requests forwarded upstream). EffectiveAccounts folds a legacy single
 	// Auth field into a one-element slice, so this handles both shapes.
 	var anthropicAccounts []*anthropicAccount
+	anthropicRoutes := map[string]anthropicRoute{}
 	if cfg.Anthropic != nil {
 		for _, ac := range cfg.Anthropic.EffectiveAccounts() {
 			authn, err := auth.Build(authConfigFromConfig(ac.Auth))
@@ -105,6 +113,17 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 				return nil, fmt.Errorf("anthropic account %q: auth: %w", ac.Name, err)
 			}
 			anthropicAccounts = append(anthropicAccounts, &anthropicAccount{name: ac.Name, auth: authn})
+		}
+		for model, route := range cfg.Anthropic.Routes {
+			authn, err := auth.Build(authConfigFromConfig(route.Auth))
+			if err != nil {
+				return nil, fmt.Errorf("anthropic route %q: auth: %w", model, err)
+			}
+			upstream := route.Upstream
+			if upstream == "" {
+				upstream = cfg.Anthropic.Upstream
+			}
+			anthropicRoutes[model] = anthropicRoute{upstream: upstream, model: route.Model, auth: authn}
 		}
 	}
 
@@ -118,6 +137,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		auths:             auths,
 		bridges:           bridges,
 		anthropicAccounts: anthropicAccounts,
+		anthropicRoutes:   anthropicRoutes,
 	}, nil
 }
 

@@ -98,6 +98,70 @@ func TestAnthropicPassthroughHeaders(t *testing.T) {
 	}
 }
 
+func TestAnthropicRouteRewritesModelAndUsesRouteAuth(t *testing.T) {
+	var gotAuth string
+	var gotBody []byte
+	var gotPath string
+	defaultHits := 0
+
+	defaultUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defaultHits++
+		w.WriteHeader(500)
+	}))
+	defer defaultUpstream.Close()
+	routeUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path + "?" + r.URL.RawQuery
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"type":"message","id":"msg_1","model":"gpt-6-luna","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer routeUpstream.Close()
+
+	cfg := &config.Config{
+		Listen:    "127.0.0.1:0",
+		Providers: map[string]config.Provider{"stub": {Type: "openai", BaseURL: "http://localhost:1/v1"}},
+		Models:    map[string]config.Model{"stub": {Provider: "stub", UpstreamModel: "stub"}},
+		Anthropic: &config.Anthropic{
+			Upstream: defaultUpstream.URL,
+			Routes: map[string]config.AnthropicRoute{
+				"claude-haiku-4-5": {
+					Upstream: routeUpstream.URL,
+					Model:    "gpt-6-luna",
+					Auth:     &config.Auth{Type: "bearer", Token: "route-token"},
+				},
+			},
+		},
+	}
+	s, err := New(cfg, discardLogger())
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+
+	rec, _ := postMessages(t, s.Handler(), map[string]any{
+		"model":      "claude-haiku-4-5",
+		"max_tokens": 10,
+		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+	})
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if defaultHits != 0 {
+		t.Fatalf("default upstream was hit %d time(s)", defaultHits)
+	}
+	if gotAuth != "Bearer route-token" {
+		t.Fatalf("route auth = %q", gotAuth)
+	}
+	if gotPath != "/v1/messages?beta=true" {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if !bytes.Contains(gotBody, []byte(`"gpt-6-luna"`)) || bytes.Contains(gotBody, []byte(`"claude-haiku-4-5"`)) {
+		t.Fatalf("body was not rewritten: %s", gotBody)
+	}
+}
+
 func TestAnthropicStripsIncomingAuthWhenNoneConfigured(t *testing.T) {
 	// Without configured auth, the handler must STRIP the incoming
 	// Authorization header so we don't leak Aperture's apikey upstream.
