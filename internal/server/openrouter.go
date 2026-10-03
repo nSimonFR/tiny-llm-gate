@@ -22,7 +22,7 @@ func normalizeOpenRouter(body []byte) (out []byte, models []string, err error) {
 	if json.Unmarshal(body, &m) != nil {
 		return body, nil, nil
 	}
-	present := false
+	present := hasServerTools(m["tools"]) || hasOnlineSuffix(m["model"])
 	for _, k := range openRouterOnly {
 		if _, ok := m[k]; ok {
 			present = true
@@ -32,9 +32,13 @@ func normalizeOpenRouter(body []byte) (out []byte, models []string, err error) {
 	if !present {
 		return body, nil, nil
 	}
+	foldWebSearch(m)
 
 	if raw, ok := m["models"]; ok {
 		_ = json.Unmarshal(raw, &models)
+		for i, mod := range models {
+			models[i] = strings.TrimSuffix(mod, onlineSuffix)
+		}
 		if _, hasModel := m["model"]; !hasModel && len(models) > 0 {
 			m["model"], _ = json.Marshal(models[0])
 		}
@@ -61,6 +65,113 @@ func normalizeOpenRouter(body []byte) (out []byte, models []string, err error) {
 	}
 	out, err = json.Marshal(m)
 	return out, models, err
+}
+
+// webSearchTool is the hosted tool the codex (ChatGPT Responses) backend runs.
+var webSearchTool = json.RawMessage(`{"type":"web_search"}`)
+
+const onlineSuffix = ":online"
+
+func hasOnlineSuffix(raw json.RawMessage) bool {
+	var model string
+	return json.Unmarshal(raw, &model) == nil && strings.HasSuffix(model, onlineSuffix)
+}
+
+func hasServerTools(raw json.RawMessage) bool {
+	var tools []struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &tools) != nil {
+		return false
+	}
+	for _, t := range tools {
+		if strings.HasPrefix(t.Type, "openrouter:") {
+			return true
+		}
+	}
+	return false
+}
+
+// foldWebSearch maps OpenRouter's three spellings of web search — the
+// openrouter:web_search tool, plugins:[{id:"web"}] and a `:online` model
+// suffix — to one hosted web_search tool. Other openrouter:* server tools
+// are dropped. Backends without web search shed it per hop (stripHostedTools).
+func foldWebSearch(m map[string]json.RawMessage) {
+	want := false
+	var model string
+	if json.Unmarshal(m["model"], &model) == nil && strings.HasSuffix(model, onlineSuffix) {
+		m["model"], _ = json.Marshal(strings.TrimSuffix(model, onlineSuffix))
+		want = true
+	}
+	var plugins []struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(m["plugins"], &plugins) == nil {
+		for _, p := range plugins {
+			want = want || p.ID == "web"
+		}
+	}
+	var tools []json.RawMessage
+	_ = json.Unmarshal(m["tools"], &tools)
+	kept := make([]json.RawMessage, 0, len(tools)+1)
+	for _, t := range tools {
+		var peek struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(t, &peek)
+		switch {
+		case peek.Type == "openrouter:web_search" || peek.Type == "web_search":
+			want = true
+		case strings.HasPrefix(peek.Type, "openrouter:"):
+		default:
+			kept = append(kept, t)
+		}
+	}
+	if want {
+		kept = append(kept, webSearchTool)
+	}
+	if len(kept) == 0 {
+		delete(m, "tools")
+		delete(m, "tool_choice")
+		return
+	}
+	m["tools"], _ = json.Marshal(kept)
+}
+
+// stripHostedTools drops non-function tools (e.g. web_search) for backends
+// that only run function tools. The body is untouched when there are none.
+func stripHostedTools(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(m["tools"], &tools) != nil {
+		return body
+	}
+	kept := make([]json.RawMessage, 0, len(tools))
+	for _, t := range tools {
+		var peek struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(t, &peek) == nil && (peek.Type == "function" || peek.Type == "") {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) == len(tools) {
+		return body
+	}
+	if len(kept) == 0 {
+		delete(m, "tools")
+		delete(m, "tool_choice")
+	} else {
+		m["tools"], _ = json.Marshal(kept)
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // reasoningEffort maps OpenRouter's unified `reasoning` object to an effort.

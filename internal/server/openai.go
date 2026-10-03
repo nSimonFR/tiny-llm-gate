@@ -107,6 +107,9 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, upstreamPat
 		if upstreamPath == chatPath && hop.ReasoningEffort != nil {
 			newBody = injectReasoningEffort(newBody, *hop.ReasoningEffort)
 		}
+		if upstreamPath == chatPath && hop.Provider.Type == "openai" {
+			newBody = stripHostedTools(newBody)
+		}
 		done, err := s.sendUpstream(w, r, hop, upstreamPath, newBody, peek.Stream, i < len(chain)-1)
 		if done {
 			s.logServed(r, "openai", peek.Model, hop, peek.Stream, i, started)
