@@ -26,13 +26,19 @@ The four wire surfaces are:
 1. **OpenAI-compatible `/v1/...`** — used by clients that speak OpenAI
    (AFFiNE, Open WebUI, PicoClaw, any `openai`-flavoured SDK).
 2. **Anthropic-compatible `/v1/messages`** — pass-through proxy used by Claude
-   Code → an observability layer (Aperture in the reference deployment). The
-   gateway does not interpret the body; it strips client auth and applies its
-   own.
+   Code → an observability layer (Aperture in the reference deployment); it
+   strips client auth and applies its own. A model the gate defines on a
+   non-Anthropic provider is instead translated (§4.2.1), so any Anthropic
+   client can drive any backend.
 3. **Gemini-compatible `/v1beta/...`** — translation frontend used by
    AFFiNE's Gemini provider (text embeddings primarily, also `generateContent`
    / `streamGenerateContent`). Requests are translated to OpenAI shape against
    a single upstream (typically Ollama).
+Every OpenAI and Anthropic route is mirrored under **`/api/v1/...`**, and the
+OpenAI surface also speaks the **OpenRouter dialect** (§4.1.2) and the
+**OpenAI Responses API** (§4.1.3): an OpenRouter app works against the gate by
+changing only its base URL.
+
 4. **MCP transport bridges** — generic SSE-frontend, StreamableHTTP-backend
    protocol bridges. Used to expose AFFiNE's StreamableHTTP MCP server as SSE
    on the tailnet for older MCP clients (this is the `/mcp/affine` route in
@@ -132,6 +138,20 @@ models:
                                        #   requests that don't specify dimensions
     reasoning_effort: <string>         # optional; injected into chat/completions
                                        #   requests that don't specify one
+    info:                              # optional catalog metadata (§4.1 models)
+      vendor: <string>                 # namespace of the `vendor/name` id;
+                                       #   default: the provider name
+      name: <string>                   # display name; default: the slug
+      description: <string>
+      created: <unix seconds>
+      context_length: <int>
+      max_output_tokens: <int>
+      input_modalities: [text, image, …]   # default [text]
+      output_modalities: [text, …]         # default [text]
+      tokenizer: <string>                  # default "Other"
+      supported_parameters: [tools, …]     # default: see §4.1
+      pricing: {prompt: "<usd/token>", completion: "<usd/token>",
+                request: "<usd>", image: "<usd>"}   # default "0"
 ```
 
 Validation:
@@ -213,6 +233,29 @@ Validation:
 - `upstream` required.
 - If `auth` present, validated the same way as provider auth.
 
+### 3.7 `client_keys`
+
+Optional. When non-empty, every LLM route (OpenAI, OpenRouter, Responses,
+Anthropic, Gemini — not `/health`, `/ready` or MCP bridges) requires a key.
+
+```yaml
+client_keys:
+  - name: <string>          # required, unique; logged as `client`
+    key: <string>           # exactly one of key / key_file
+    key_file: <path>        #   (read once at startup, trimmed)
+    models: [<pattern>, …]  # optional allowlist; empty = every model
+    rpm: <int>              # optional requests/minute (fixed window); 0 = ∞
+```
+
+Allowlist patterns: a model or alias name, a `vendor/name` slug, or a prefix
+glob ending in `*` (`*` alone = everything). A pattern matches a request
+when it equals the client-supplied id, the canonical model it resolves to,
+or that model's slug. Gemini-side and Anthropic-passthrough ids (e.g.
+`claude-*`) are matched against the client-supplied id only.
+
+Validation: `name` required and unique; exactly one of `key`/`key_file`;
+`rpm >= 0`; two keys with the same secret are rejected at startup.
+
 ---
 
 ## 4. HTTP surface
@@ -226,15 +269,30 @@ a request ID (see §7.1).
 |--------|------|---------|
 | POST   | `/v1/chat/completions` | OpenAI chat completion, streaming + non-streaming |
 | POST   | `/v1/embeddings`       | OpenAI embeddings |
-| GET    | `/v1/models`           | Lists all canonical model names + aliases |
+| POST   | `/v1/responses`        | OpenAI Responses API (§4.1.3) |
+| GET    | `/v1/models`, `/v1/models/user` | Model catalog (OpenRouter shape) |
+| GET    | `/v1/models/{id}`      | One catalog entry (`id` may contain `/`) |
+| GET    | `/v1/key`, `/v1/auth/key` | OpenRouter key info (§4.1.2) |
+| GET    | `/v1/credits`          | OpenRouter credits (§4.1.2) |
+
+Every row (and `POST /v1/messages`, §4.2) is also served under `/api/v1/…`.
+
+**Errors** from the gate itself use
+`{"error":{"message":…,"type":"tiny_llm_gate_error","code":<http status>}}`
+— the numeric `code` is what OpenRouter clients read.
 
 #### Request handling (`/v1/chat/completions`, `/v1/embeddings`)
 
 1. **Read body** — bounded by **8 MiB**.
+   - *Chat only:* fold the OpenRouter dialect (§4.1.2). The body is
+     untouched unless an OpenRouter-only field is present.
 2. **Inspect** the `model` and `stream` fields. Missing/invalid → `400`.
 3. **Resolve** the model through `aliases → models → providers`. Unknown →
    `404`.
-4. **Build chain** = `[resolved_model, fallback[0], fallback[1], ...]`.
+   The caller's key must allow the model (§3.7), else `403`.
+4. **Build chain** = `[resolved_model, <OpenRouter models[]…>, fallback[0],
+   fallback[1], ...]`, deduplicated; `models[]` entries the key may not use
+   are skipped.
 5. For each hop in the chain:
    - Rewrite the body's top-level `model` field to the hop's
      `upstream_model`. **Field order in the body MUST be preserved** — only
@@ -305,20 +363,83 @@ error) before writing bytes falls through to the next chain entry.
 
 #### `GET /v1/models`
 
-Returns:
+Returns the OpenRouter catalog shape, which is also a valid OpenAI list:
 
 ```json
 {
-  "object": "list",
-  "data": [
-    {"id": "<name>", "object": "model", "created": 0, "owned_by": "tiny-llm-gate"},
-    ...
-  ]
+  "object": "list", "total_count": 3, "links": {"next": null},
+  "data": [{
+    "id": "<id>", "object": "model", "created": 0, "owned_by": "<provider>",
+    "canonical_slug": "<vendor>/<model>", "name": "…", "description": "",
+    "context_length": 400000 | null,
+    "architecture": {"modality": "text+image->text", "input_modalities": [...],
+                     "output_modalities": [...], "tokenizer": "Other",
+                     "instruct_type": null},
+    "pricing": {"prompt": "0", "completion": "0"},
+    "top_provider": {"context_length": …, "max_completion_tokens": …,
+                     "is_moderated": false},
+    "per_request_limits": null, "default_parameters": null,
+    "supported_voices": null, "links": {"details": "/api/v1/models/<id>"},
+    "supported_parameters": ["max_tokens", "temperature", …]
+  }]
 }
 ```
 
-Lists every `models.<name>` key **and** every `aliases.<name>` key. Order is
-not guaranteed stable.
+- Lists every model name, every alias, and every model's `vendor/name` slug
+  (§5.2), sorted by id; aliases and slugs carry their target's metadata.
+- Filtered to the caller key's allowlist.
+- `?supported_parameters=a,b` keeps entries supporting all listed params.
+- Unset metadata defaults: modalities `[text]`, pricing `"0"`, lengths
+  `null`, `supported_parameters` = `max_tokens temperature top_p stop tools
+  tool_choice response_format structured_outputs reasoning
+  include_reasoning`.
+- `default_parameters`, `supported_voices`, `links` and the list's
+  `total_count`/`links` are required by `@openrouter/sdk`'s response schema.
+
+#### 4.1.2 OpenRouter dialect
+
+An OpenRouter client needs only a new base URL (`https://<gate>/api/v1`).
+
+- **Request fields** — `models`, `provider`, `transforms`, `route`, `usage`,
+  `reasoning`, `plugins` are removed before forwarding (strict upstreams
+  reject unknown fields), after being folded:
+  - `models: [...]` → extra hops after the primary (§4.1 step 4); when
+    `model` is absent, `models[0]` becomes the model.
+  - `reasoning` → `reasoning_effort` unless the client set one:
+    `enabled:false` → `none`; `effort` verbatim; `max_tokens` ≤4096 → `low`,
+    >16384 → `high`, else `medium`.
+  - `usage.include` on a streaming request → `stream_options.include_usage`.
+  - `provider`, `transforms`, `route`, `plugins` are accepted and ignored.
+- **Attribution** — `X-Title` (else `HTTP-Referer`) is logged as `app`.
+- **`GET /key`** → `{"data":{"label":<key name | "open">,"limit":null,
+  "limit_remaining":null,"usage":0,…,"rate_limit":{"requests":<rpm | -1>,
+  "interval":"1m"}}}`. The gate meters nothing, so usage is always 0.
+- **`GET /credits`** → `{"data":{"total_credits":0,"total_usage":0}}`.
+- **Responses** pass through unchanged. Non-streaming completions from the
+  codex/anthropic translators carry `"system_fingerprint": null` (required
+  by `@openrouter/sdk`).
+
+#### 4.1.3 Responses API (`POST /v1/responses`)
+
+Served for every provider type by translating to a chat request and back:
+
+- `instructions` → a leading system message; `input` (a string, or items)
+  → messages: `message` items (`developer` → `system`; `input_text`,
+  `output_text`, `input_image` parts), `function_call` items fold into the
+  preceding assistant turn's `tool_calls`, `function_call_output` → `tool`
+  messages, `reasoning` items are dropped.
+- `tools` (function only) → chat tools; `tool_choice`
+  `{type:function,name}` → chat's nested form; `reasoning.effort` →
+  `reasoning_effort`; `text.format` → `response_format`;
+  `max_output_tokens` → `max_tokens`.
+- The upstream is always asked to stream (with usage); a non-streaming
+  client gets the aggregated `Response` object, a streaming one gets the
+  Responses SSE events (`response.created` … `response.completed`, with
+  `output_item`/`content_part`/`output_text`/`function_call_arguments`/
+  `reasoning_summary_text` events). `finish_reason: length` →
+  `status: incomplete`.
+- **Stateless:** `previous_response_id` → `400`; non-function tools and
+  `file_id` images → `400`. Fallback works as in §4.1.
 
 ### 4.2 Anthropic frontend (`/v1/messages`)
 
@@ -357,6 +478,28 @@ Request flow:
    `Content-Type` starts with `text/event-stream`. Otherwise plain byte copy.
 
 **No fallback chain is run for Anthropic** — single upstream, single attempt.
+
+#### 4.2.1 Dispatch and translation
+
+The handler picks one path per request, in order:
+
+1. An `anthropic.routes` match → that route (pass-through to its upstream).
+2. A gate model (§5.2) on a **non-`anthropic`** provider → translated:
+   Messages → chat (`system` → system message; `tool_use` → `tool_calls`;
+   `tool_result` → `tool` messages placed before the turn's text; images →
+   `image_url`; `tool_choice` `any` → `required`; `thinking.budget_tokens`
+   → `reasoning_effort` low/medium/high at ≤4096/≤16384/above), run through
+   the fallback chain, and re-encoded as a Message or Messages SSE
+   (`message_start`, `content_block_*` with `text_delta`/`thinking_delta`/
+   `input_json_delta`, `message_delta`, `message_stop`). Upstream errors use
+   the Anthropic error envelope.
+3. A gate model on an `anthropic` provider → pass-through with `model`
+   rewritten to its `upstream_model`.
+4. Anything else → verbatim pass-through. With no `anthropic` block
+   configured this is `404 not_found_error`.
+
+The route is registered even without an `anthropic` block. Under
+`/api/v1/messages` the upstream path is still `/v1/messages`.
 
 ### 4.3 Gemini frontend (`/v1beta/...`)
 
@@ -574,7 +717,10 @@ Given a client-supplied model name, resolution produces:
   cycle. Cycles MUST be detected and surfaced as a resolution error
   (`alias cycle involving "<name>"`).
 - Once the chain lands on a name that is **not** an alias, look it up in
-  `models`. Unknown → `unknown model "<name>"`.
+  `models`; failing that, as a slug: `<vendor>/<model>` and
+  `<provider>/<model>` both name model `<model>` (vendor = `info.vendor`,
+  else the provider name). An explicit model or alias with the same id wins
+  over a slug. Unknown → `unknown model "<name>"`.
 - The resolved model's provider MUST exist.
 
 ### 5.3 Fallback semantics
@@ -593,8 +739,8 @@ Given a client-supplied model name, resolution produces:
 
 ### 5.4 Model list
 
-Model listing MUST return every key from both `models` and `aliases`
-(unsorted is acceptable). Used by `/v1/models` and `/v1beta/models`. See
+Model listing MUST return every key from both `models` and `aliases`, plus
+every model's `vendor/name` slug (§5.2). Used by `/v1/models` and `/v1beta/models`. See
 invariant §11.8 — AFFiNE's `CopilotProviderFactory` keys provider routing on
 this list and breaks if aliases are dropped.
 
@@ -604,17 +750,20 @@ this list and breaks if aliases are dropped.
 
 ### 6.1 Inbound
 
-**The gateway does NOT authenticate inbound requests.** All exposed routes
-are open. Security relies entirely on:
+**Without `client_keys` the gateway does not authenticate inbound
+requests** — security then relies on binding to `127.0.0.1`, tailnet-only
+exposure and the systemd sandbox.
 
-- Binding to `127.0.0.1` (default `listen`).
-- Tailscale Serve providing tailnet-only HTTPS termination upstream.
-- The systemd sandbox in the NixOS module.
+With `client_keys` (§3.7), every LLM route requires a key, taken from the
+first present of: `Authorization: Bearer`, `x-api-key`, `x-goog-api-key`,
+`?key=`. So OpenAI, OpenRouter, Anthropic and Gemini SDKs all work with
+their usual key setting.
 
-The README's earlier claim that "the gateway refuses unauthenticated
-requests by design" describes a non-existent inbound auth layer. If you need
-client auth, add it externally (Tailscale Aperture, an Nginx `auth_request`,
-or a separate reverse-proxy).
+- Keys are compared by SHA-256 digest (no byte-wise secret comparison).
+- Missing/unknown key → `401`; model outside the allowlist → `403`;
+  over `rpm` → `429` with `Retry-After` (seconds to the window's end).
+- `/v1/models`, `/v1beta/models` and `/key` reflect the caller's key.
+- The client's key never reaches an upstream (§6.4).
 
 ### 6.2 Outbound
 
@@ -815,10 +964,11 @@ broken.
    defeat the gateway's auth swap, because Anthropic prefers `x-api-key`
    when both headers are present. See §4.2, §6.4.
 
-3. **The Anthropic handler does not mutate the request body.** The point of
-   the pass-through is verbatim forwarding for the observability layer
-   (Aperture) sitting upstream. Do not add body parsing or model rewriting
-   on this path. See §4.2.
+3. **The Anthropic pass-through does not mutate the request body** for a
+   model id the gate does not define — verbatim forwarding is what the
+   observability layer (Aperture) upstream relies on. Only gate-defined ids
+   are rewritten (`anthropic.routes`, anthropic-type models) or translated
+   (§4.2.1).
 
 4. **Fallback only fires before bytes are written to the client.** Once the
    status code or any body byte has been emitted to the client, the
@@ -830,7 +980,9 @@ broken.
    remain byte-stable except for the replaced value. A parse-into-map /
    re-serialize approach reorders fields by map iteration and is therefore
    forbidden. Observability sniffers downstream (Aperture) rely on
-   byte-stable bodies for diffing and replay. See §4.1.
+   byte-stable bodies for diffing and replay. See §4.1. Sole exception: a
+   chat body carrying OpenRouter-only fields is re-serialized when they are
+   stripped (§4.1.2); a plain OpenAI body is never re-serialized.
 
 6. **Config validation rejects unknown YAML fields.** Strict mode is
    mandatory — silently ignoring an unknown key has historically masked
@@ -851,19 +1003,24 @@ broken.
    to produce stalls. The HTTP/1.1 + flush combination is deliberate. See
    §4.6.
 
+10. **The OpenAI and Anthropic surfaces are mirrored under `/api/v1`.**
+    That prefix is OpenRouter's base path; apps that hardcode it reach the
+    gate by swapping only the host. See §4.1.
+
 ---
 
 ## 12. Non-goals
 
-- USD cost tracking.
+- USD cost tracking, usage metering, credits (the `/key` and `/credits`
+  endpoints report zeros).
 - Prometheus `/metrics`.
-- Multi-tenant billing or quotas.
-- Request rate limiting.
-- Tokenizer-based features (counting, truncation).
+- Multi-tenant billing or token/spend quotas (only per-key `rpm`).
+- OpenRouter provider-routing preferences (`provider` is accepted and
+  ignored) and `/generation` lookups.
+- Stored responses: `previous_response_id`, `GET /v1/responses/{id}`.
+- Tokenizer-based features (counting, truncation, `count_tokens`).
 - Multimodal Gemini parts (images, audio, video).
 - Gemini safety settings.
-- Anthropic body translation or model rewriting.
-- Inbound client authentication. (See §6.1.)
 - SIGHUP / hot-reload.
 
 ---
@@ -892,7 +1049,14 @@ broken.
 - **OpenAI frontend**: `internal/server/openai.go` — includes the
   order-preserving token-stream body rewriter for §11.5.
 - **Anthropic frontend**: `internal/server/anthropic.go` — pass-through
-  handler with header strip + auth swap.
+  handler with header strip + auth swap, and the §4.2.1 dispatch;
+  translation in `internal/messages`.
+- **Responses frontend**: `internal/server/translated.go` (shared chain
+  runner for translated frontends); translation in `internal/responses`.
+- **Chat decoding**: `internal/oaichat` — turns a chat.completion or its SSE
+  into events both translated frontends re-encode.
+- **OpenRouter dialect & catalog**: `internal/server/openrouter.go`.
+- **Client keys**: `internal/server/clientauth.go`.
 - **Gemini frontend**: `internal/server/gemini.go` (dispatcher);
   `internal/gemini` (wire types + Gemini↔OpenAI translator).
 - **MCP bridge**: `internal/mcp` — SSE frontend, StreamableHTTP backend,

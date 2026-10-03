@@ -172,6 +172,9 @@ func TestCollect_TextAndUsage(t *testing.T) {
 	if resp.Usage == nil || resp.Usage.TotalTokens != 6 {
 		t.Fatalf("usage = %+v", resp.Usage)
 	}
+	if !strings.Contains(string(out), `"system_fingerprint":null`) {
+		t.Fatalf("system_fingerprint key missing: %s", out)
+	}
 }
 
 func TestCollect_ToolCalls(t *testing.T) {

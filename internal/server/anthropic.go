@@ -15,6 +15,7 @@ import (
 
 	"github.com/nSimonFR/tiny-llm-gate/internal/anthropic"
 	"github.com/nSimonFR/tiny-llm-gate/internal/auth"
+	"github.com/nSimonFR/tiny-llm-gate/internal/messages"
 	"github.com/nSimonFR/tiny-llm-gate/internal/resolve"
 )
 
@@ -230,9 +231,9 @@ func (s *Server) benchIfExhausted(ctx context.Context, acct *anthropicAccount, r
 // to callers. A single-account gate has no failover target, so its 401/429
 // passes straight through.
 //
-// Intended to sit behind an observability layer (e.g. Aperture) so the full
-// request and response body are logged there — tiny-llm-gate does not
-// inspect or rewrite the payload.
+// Ids the gate does not define pass through verbatim, for the observability
+// layer (e.g. Aperture) upstream. Gate-defined ids are rewritten or, for
+// non-Anthropic providers, translated (SPEC §4.2.1).
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	reqID := requestID(r.Context())
@@ -254,15 +255,43 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Precedence: an explicit route, then a gate model (translated unless it
+	// is an anthropic-type model), then the raw Anthropic passthrough.
+	routeName, route, routed := s.matchAnthropicRoute(peek.Model)
+	var res *resolve.Resolved
+	if !routed {
+		if r2, err := s.resolver.Resolve(peek.Model); err == nil {
+			res = r2
+		}
+	}
+	if !s.modelAllowed(w, r, peek.Model, res) {
+		return
+	}
+	if res != nil && res.Provider.Type != "anthropic" {
+		s.serveMessagesTranslated(w, r, body, res)
+		return
+	}
+	if s.cfg.Anthropic == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write(messages.ErrorBody("not_found_error", "unknown model "+peek.Model))
+		return
+	}
+	if res != nil && res.UpstreamModel != peek.Model {
+		if body, err = rewriteModelField(body, res.UpstreamModel); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "could not rewrite anthropic model")
+			return
+		}
+	}
+
 	// Build upstream URL preserving query string (e.g. ?beta=true). A route can
 	// redirect one model id to another Messages-compatible upstream and rewrite
 	// the model before forwarding.
-	routeName, route, routed := s.matchAnthropicRoute(peek.Model)
 	upstreamRoot := s.cfg.Anthropic.Upstream
 	if routed && route.upstream != "" {
 		upstreamRoot = route.upstream
 	}
-	upstream := strings.TrimRight(upstreamRoot, "/") + r.URL.Path
+	upstream := strings.TrimRight(upstreamRoot, "/") + strings.TrimPrefix(r.URL.Path, "/api")
 	if r.URL.RawQuery != "" {
 		upstream += "?" + r.URL.RawQuery
 	}
@@ -294,7 +323,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		} else {
 			_, _ = io.Copy(w, resp.Body)
 		}
-		s.logger.Info("served", "request_id", reqID, "frontend", "anthropic", "model", peek.Model, "account", "route:"+routeName, "stream", peek.Stream, "status", resp.StatusCode, "latency_ms", time.Since(started).Milliseconds())
+		s.logger.Info("served", "request_id", reqID, "frontend", "anthropic", "client", clientName(r), "model", peek.Model, "account", "route:"+routeName, "stream", peek.Stream, "status", resp.StatusCode, "latency_ms", time.Since(started).Milliseconds())
 		return
 	}
 
@@ -331,6 +360,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	s.logger.Info("served",
 		"request_id", reqID,
 		"frontend", "anthropic",
+		"client", clientName(r),
 		"model", peek.Model,
 		"account", accountName,
 		"stream", peek.Stream,

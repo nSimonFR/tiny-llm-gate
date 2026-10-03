@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 const validConfig = `
 listen: 127.0.0.1:4001
@@ -555,5 +558,49 @@ func TestParseAnthropicAbsent(t *testing.T) {
 	}
 	if c.Anthropic != nil {
 		t.Errorf("expected nil anthropic, got %+v", c.Anthropic)
+	}
+}
+
+func TestParseClientKeysAndModelInfo(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := dir + "/k"
+	if err := os.WriteFile(keyFile, []byte("secret-from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse([]byte(`
+providers:
+  p: {type: openai, base_url: "http://x/v1"}
+models:
+  m:
+    provider: p
+    upstream_model: up
+    info: {vendor: acme, context_length: 1000, pricing: {prompt: "0.1", completion: "0.2"}}
+client_keys:
+  - {name: a, key: inline, models: ["m", "acme/*"], rpm: 10}
+  - {name: b, key_file: ` + keyFile + `}
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := c.Models["m"].Vendor(); got != "acme" {
+		t.Errorf("vendor = %q", got)
+	}
+	if k, err := c.ClientKeys[1].LoadKey(); err != nil || k != "secret-from-file" {
+		t.Errorf("LoadKey = %q, %v", k, err)
+	}
+}
+
+func TestParseRejectsBadClientKeys(t *testing.T) {
+	base := "providers:\n  p: {type: openai, base_url: \"http://x/v1\"}\nmodels:\n  m: {provider: p, upstream_model: up}\n"
+	for name, keys := range map[string]string{
+		"missing name": `[{key: k}]`,
+		"no secret":    `[{name: a}]`,
+		"both secrets": `[{name: a, key: k, key_file: /f}]`,
+		"duplicate":    `[{name: a, key: k}, {name: a, key: j}]`,
+		"negative rpm": `[{name: a, key: k, rpm: -1}]`,
+	} {
+		if _, err := Parse([]byte(base + "client_keys: " + keys + "\n")); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
 	}
 }

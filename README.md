@@ -1,12 +1,12 @@
 # tiny-llm-gate
 
-A memory-conscious, OpenAI-compatible LLM gateway.
+A memory-conscious LLM gateway that speaks OpenAI, OpenRouter, Anthropic and Gemini — point an OpenRouter app at `http://<host>:4001/api/v1` and it works unchanged.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## AI Installation Prompt
 
-> Install `tiny-llm-gate` on a generic Linux or macOS host. **Done when** `curl -sH "Authorization: Bearer <gateway-token>" http://127.0.0.1:4001/v1/models` returns a JSON object with a non-empty `data` array.
+> Install `tiny-llm-gate` on a generic Linux or macOS host. **Done when** `curl -sH "Authorization: Bearer <client-key>" http://127.0.0.1:4001/api/v1/models` returns a JSON object with a non-empty `data` array.
 >
 > 1. Clone: `git clone https://github.com/nSimonFR/tiny-llm-gate && cd tiny-llm-gate`
 > 2. Read first (in this order): `SPEC.md` — the authoritative spec of the running surface, then `README.md`, `go.mod`, `cmd/tiny-llm-gate/main.go`, `testdata/example-config.yaml`. Toolchain is Go ≥ 1.25. **`SPEC.md` wins over the README where they disagree** — it was derived directly from the source.
@@ -14,16 +14,12 @@ A memory-conscious, OpenAI-compatible LLM gateway.
 >    - `nix build && cp result/bin/tiny-llm-gate ~/.local/bin/`
 >    - `go build -o ~/.local/bin/tiny-llm-gate ./cmd/tiny-llm-gate`
 >    Verify: `tiny-llm-gate --help` lists `-config` (or the equivalent flag).
-> 4. Write a `config.yaml`. At minimum it must declare:
->    - One `auth:` entry (a bearer token clients will use against the gateway).
->    - One `providers:` entry (Anthropic / OpenAI / Gemini). For Anthropic OAuth, set `auth_file:` to a path containing the raw bearer token; the gateway re-reads on each request.
->    - One `routes:` entry mapping a model name to a provider.
->    Examples live in the README or `*.example.yaml`.
+> 4. Write a `config.yaml` (see "Config reference" below and `testdata/example-config.yaml`). At minimum: one `providers:` entry and one `models:` entry naming it. To require keys from clients, add `client_keys:` — without it the gateway accepts any caller.
 > 5. Run: `tiny-llm-gate -config config.yaml`. Default listen is `:4001`.
-> 6. Point any OpenAI-compatible client at `http://<host>:4001/v1`, using whichever token you put under `auth:`.
+> 6. Point any OpenAI-compatible client at `http://<host>:4001/v1`, an OpenRouter client at `http://<host>:4001/api/v1`, or an Anthropic client (Claude Code: `ANTHROPIC_BASE_URL`) at `http://<host>:4001`, using a key from `client_keys:`.
 > 7. NixOS hosts have a `services.tiny-llm-gate` module — see `module.nix`.
 >
-> **The gateway refuses unauthenticated requests by design.** If `auth:` is missing the daemon exits at startup, not silently — do not patch around it.
+> **Without `client_keys:` the gateway is open** to anyone who can reach its port — keep the default `127.0.0.1` listen or add keys before exposing it.
 ## Why
 
 If you self-host LLMs (Ollama, llama.cpp) on a small box and want a single endpoint that:
@@ -87,9 +83,20 @@ models:                     # canonical model names
     fallback:               # optional: try these models on 5xx upstream errors
       - <name>
       - <name>
+    info:                   # optional OpenRouter catalog metadata
+      vendor: openai        # → also addressable as "openai/<name>"
+      context_length: 400000
+      input_modalities: [text, image]
+      pricing: {prompt: "0.000001", completion: "0.000004"}
 
 aliases:                    # client-facing model name → canonical model
   <alias>: <model>          # chains are supported (cycle-detected)
+
+client_keys:                # optional; when set, every LLM route needs a key
+  - name: my-app            # shown as `client` in logs and by GET /api/v1/key
+    key_file: /run/secrets/my-app-key   # or key: <string>
+    models: ["openai/*"]    # optional allowlist (names, slugs, prefix*)
+    rpm: 60                 # optional requests/minute
 
 ```
 
@@ -99,15 +106,20 @@ See [`testdata/example-config.yaml`](testdata/example-config.yaml) for a fuller 
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST   | `/v1/chat/completions` | OpenAI chat, streaming + non-streaming |
+| POST   | `/v1/chat/completions` | OpenAI chat, streaming + non-streaming; also accepts OpenRouter's `models`, `reasoning`, `provider`, `usage` |
 | POST   | `/v1/embeddings`       | OpenAI embeddings |
-| GET    | `/v1/models`           | list all model names + aliases |
+| POST   | `/v1/responses`        | OpenAI Responses API, any backend (stateless) |
+| POST   | `/v1/messages`         | Anthropic Messages: Claude passthrough, or any gate model translated |
+| GET    | `/v1/models`           | OpenRouter-shape catalog: names, aliases, `vendor/model` slugs |
+| GET    | `/v1/key`, `/v1/credits` | OpenRouter key check / credits |
 | POST   | `/v1beta/models/{m}:generateContent`       | Gemini chat, non-streaming |
 | POST   | `/v1beta/models/{m}:streamGenerateContent` | Gemini chat, streaming (newline-delimited JSON) |
 | POST   | `/v1beta/models/{m}:embedContent`          | Gemini single-item embedding |
 | POST   | `/v1beta/models/{m}:batchEmbedContents`    | Gemini batch embedding |
 | GET    | `/health`              | liveness |
 | GET    | `/ready`               | readiness (config loaded) |
+
+Every `/v1/...` route above is also served at `/api/v1/...` (OpenRouter's base path).
 
 Gemini requests are transparently translated to OpenAI format before being forwarded to the upstream — you can point an AFFiNE Gemini provider at this gateway and route to an Ollama backend.
 

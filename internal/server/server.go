@@ -50,6 +50,8 @@ type Server struct {
 	// stays on one account until it 429s, then advances this and stays on
 	// the new one — see pickAnthropicAccount / nextAnthropicAccount.
 	currentAnthropic atomic.Int32
+	// clientKeys indexes inbound keys by SHA-256; empty = open gate.
+	clientKeys map[[32]byte]*clientKey
 }
 
 // New builds a Server. The *http.Client has generous timeouts for streaming
@@ -141,9 +143,16 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	}
 	sort.Slice(anthropicRouteKeys, func(i, j int) bool { return len(anthropicRouteKeys[i]) > len(anthropicRouteKeys[j]) })
 
+	resolver := resolve.New(cfg)
+	clientKeys, err := buildClientKeys(cfg, resolver)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Server{
-		cfg:      cfg,
-		resolver: resolve.New(cfg),
+		cfg:        cfg,
+		resolver:   resolver,
+		clientKeys: clientKeys,
 		// No overall Timeout — streaming responses can legitimately run
 		// for minutes. Per-phase timeouts live on the Transport.
 		client:             &http.Client{Transport: transport},
@@ -221,24 +230,27 @@ func authConfigFromConfig(a *config.Auth, logger *slog.Logger) *auth.AuthConfig 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// OpenAI frontend
-	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
-	mux.HandleFunc("POST /v1/embeddings", s.handleEmbeddings)
-	mux.HandleFunc("GET /v1/models", s.handleModels)
+	// OpenAI / OpenRouter frontends. /api/v1 is OpenRouter's base path, so an
+	// OpenRouter app works by swapping only its host.
+	for _, p := range []string{"/v1", "/api/v1"} {
+		mux.HandleFunc("POST "+p+"/chat/completions", s.guard(s.handleChatCompletions))
+		mux.HandleFunc("POST "+p+"/embeddings", s.guard(s.handleEmbeddings))
+		mux.HandleFunc("POST "+p+"/responses", s.guard(s.handleResponses))
+		mux.HandleFunc("POST "+p+"/messages", s.guard(s.handleAnthropicMessages))
+		mux.HandleFunc("GET "+p+"/models", s.guard(s.handleModels))
+		mux.HandleFunc("GET "+p+"/models/user", s.guard(s.handleModels))
+		mux.HandleFunc("GET "+p+"/models/{id...}", s.guard(s.handleModel))
+		mux.HandleFunc("GET "+p+"/key", s.guard(s.handleKey))
+		mux.HandleFunc("GET "+p+"/auth/key", s.guard(s.handleKey))
+		mux.HandleFunc("GET "+p+"/credits", s.guard(s.handleCredits))
+	}
 
 	// Gemini frontend. The Gemini URL form is /v1beta/models/{model}:action
 	// where `:action` is a suffix on the final path segment, not a separator
 	// Go's ServeMux handles natively. We route by prefix and dispatch on the
 	// action in a single handler.
-	mux.HandleFunc("GET /v1beta/models", s.handleGeminiModels)
-	mux.HandleFunc("POST /v1beta/models/", s.routeGemini)
-
-	// Anthropic frontend (pass-through proxy to api.anthropic.com).
-	// Registered only when configured so clients hit 404 for /v1/messages
-	// on gates that don't have Anthropic support enabled.
-	if s.cfg.Anthropic != nil {
-		mux.HandleFunc("POST /v1/messages", s.handleAnthropicMessages)
-	}
+	mux.HandleFunc("GET /v1beta/models", s.guard(s.handleGeminiModels))
+	mux.HandleFunc("POST /v1beta/models/", s.guard(s.routeGemini))
 
 	// Health and readiness
 	mux.HandleFunc("GET /health", s.handleHealth)

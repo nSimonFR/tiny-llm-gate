@@ -5,6 +5,7 @@ package resolve
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/nSimonFR/tiny-llm-gate/internal/config"
 )
@@ -12,10 +13,28 @@ import (
 // Resolver is safe for concurrent reads. Rebuilt on config reload.
 type Resolver struct {
 	cfg *config.Config
+	// slugs maps `vendor/model` (and `provider/model`) ids to canonical model
+	// names. Explicit model/alias names shadow them.
+	slugs map[string]string
 }
 
 // New creates a Resolver over an already-validated config.
-func New(cfg *config.Config) *Resolver { return &Resolver{cfg: cfg} }
+func New(cfg *config.Config) *Resolver {
+	r := &Resolver{cfg: cfg, slugs: map[string]string{}}
+	for name, m := range cfg.Models {
+		for _, ns := range []string{m.Vendor(), m.Provider} {
+			id := ns + "/" + name
+			if _, taken := cfg.Models[id]; taken {
+				continue
+			}
+			if _, taken := cfg.Aliases[id]; taken {
+				continue
+			}
+			r.slugs[id] = name
+		}
+	}
+	return r
+}
 
 // Resolved describes a concrete routing decision.
 type Resolved struct {
@@ -39,6 +58,10 @@ type Resolved struct {
 	// ReasoningEffort, when set, is the default reasoning_effort to inject
 	// into chat/completions requests that don't specify one.
 	ReasoningEffort *string
+	// Info is the model's optional catalog metadata.
+	Info *config.ModelInfo
+	// Slug is the model's `vendor/name` id.
+	Slug string
 }
 
 // Resolve looks up a model by the name a client provided. Alias chains are
@@ -56,6 +79,11 @@ func (r *Resolver) Resolve(name string) (*Resolved, error) {
 			continue
 		}
 		break
+	}
+	if _, ok := r.cfg.Models[current]; !ok {
+		if canonical, ok := r.slugs[current]; ok {
+			current = canonical
+		}
 	}
 	m, ok := r.cfg.Models[current]
 	if !ok {
@@ -75,6 +103,8 @@ func (r *Resolver) Resolve(name string) (*Resolved, error) {
 		FallbackOnStatus:       m.FallbackOnStatus,
 		DefaultEmbedDimensions: m.DefaultEmbedDimensions,
 		ReasoningEffort:        m.ReasoningEffort,
+		Info:                   m.Info,
+		Slug:                   m.Vendor() + "/" + current,
 	}, nil
 }
 
@@ -88,5 +118,18 @@ func (r *Resolver) ListModels() []string {
 	for name := range r.cfg.Aliases {
 		out = append(out, name)
 	}
+	return out
+}
+
+// ListSlugs returns the `vendor/name` id of every concrete model, sorted.
+func (r *Resolver) ListSlugs() []string {
+	out := make([]string, 0, len(r.cfg.Models))
+	for name, m := range r.cfg.Models {
+		id := m.Vendor() + "/" + name
+		if _, ok := r.slugs[id]; ok {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
