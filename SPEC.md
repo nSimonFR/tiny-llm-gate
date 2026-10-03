@@ -409,7 +409,15 @@ An OpenRouter client needs only a new base URL (`https://<gate>/api/v1`).
     `enabled:false` → `none`; `effort` verbatim; `max_tokens` ≤4096 → `low`,
     >16384 → `high`, else `medium`.
   - `usage.include` on a streaming request → `stream_options.include_usage`.
-  - `provider`, `transforms`, `route`, `plugins` are accepted and ignored.
+  - Web search — an `openrouter:web_search` tool, `plugins: [{id: "web"}]`, or a
+    `:online` model suffix (also on `models[]` entries, stripped) — becomes one
+    hosted `{"type":"web_search"}` tool. Other `openrouter:*` server tools are
+    dropped; `tool_choice` goes with the last tool.
+  - `provider`, `transforms`, `route` and other `plugins` are accepted and ignored.
+- **Hosted tools per backend** — codex runs `web_search` natively (the ChatGPT
+  backend searches and cites); anthropic-type skips non-function tools; for
+  `openai`-type hops every non-function tool is stripped before forwarding (the
+  body is re-serialized only when one is present).
 - **Attribution** — `X-Title` (else `HTTP-Referer`) is logged as `app`.
 - **`GET /key`** → `{"data":{"label":<key name | "open">,"limit":null,
   "limit_remaining":null,"usage":0,…,"rate_limit":{"requests":<rpm | -1>,

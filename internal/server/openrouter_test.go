@@ -471,3 +471,61 @@ func TestMessagesUnknownModelWithoutAnthropic(t *testing.T) {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
 }
+
+func TestWebSearchFolding(t *testing.T) {
+	fn := `{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}`
+	cases := map[string]struct{ in, model, tools string }{
+		"server tool":       {`{"model":"m","tools":[` + fn + `,{"type":"openrouter:web_search","parameters":{"max_results":3}}]}`, "m", `[` + fn + `,{"type":"web_search"}]`},
+		"plugin web":        {`{"model":"m","plugins":[{"id":"web"}]}`, "m", `[{"type":"web_search"}]`},
+		":online suffix":    {`{"model":"openai/gpt-5.5:online"}`, "openai/gpt-5.5", `[{"type":"web_search"}]`},
+		"other server tool": {`{"model":"m","tools":[{"type":"openrouter:datetime"}],"tool_choice":"auto"}`, "m", ``},
+	}
+	for name, c := range cases {
+		out, _, err := normalizeOpenRouter([]byte(c.in))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		var m map[string]json.RawMessage
+		_ = json.Unmarshal(out, &m)
+		var model string
+		_ = json.Unmarshal(m["model"], &model)
+		if model != c.model {
+			t.Errorf("%s: model = %q, want %q", name, model, c.model)
+		}
+		if got := compactJSON(m["tools"]); got != c.tools {
+			t.Errorf("%s: tools = %s, want %s", name, got, c.tools)
+		}
+		if c.tools == "" && m["tool_choice"] != nil {
+			t.Errorf("%s: tool_choice should go with the last tool", name)
+		}
+	}
+}
+
+func compactJSON(raw json.RawMessage) string {
+	if raw == nil {
+		return ""
+	}
+	var b bytes.Buffer
+	_ = json.Compact(&b, raw)
+	return b.String()
+}
+
+func TestHostedToolsStrippedOnlyForOpenAIBackends(t *testing.T) {
+	up := newRecordingUpstream(t, 200, "application/json", okChat)
+	h := orServer(t, up.URL, nil).Handler()
+	rec := do(t, h, "POST", "/api/v1/chat/completions", `{"model":"gemma4","messages":[],"tools":[{"type":"openrouter:web_search"}],"tool_choice":"auto"}`, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
+	}
+	got := up.last(t)
+	if _, ok := got["tools"]; ok {
+		t.Errorf("hosted tool reached an openai-type upstream: %v", got["tools"])
+	}
+	if _, ok := got["tool_choice"]; ok {
+		t.Errorf("tool_choice left without tools")
+	}
+	plain := []byte(`{"z":1,"tools":[{"type":"function","function":{"name":"f"}}]}`)
+	if out := stripHostedTools(plain); !bytes.Equal(out, plain) {
+		t.Errorf("function-only body changed: %s", out)
+	}
+}
