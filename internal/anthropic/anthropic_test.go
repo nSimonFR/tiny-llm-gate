@@ -228,6 +228,9 @@ func TestCollect_ToolCall(t *testing.T) {
 	if resp.Usage == nil || resp.Usage.TotalTokens != 8 {
 		t.Fatalf("usage = %+v", resp.Usage)
 	}
+	if !strings.Contains(string(out), `"system_fingerprint":null`) {
+		t.Fatalf("system_fingerprint key missing: %s", out)
+	}
 }
 
 func TestStream_UpstreamError(t *testing.T) {

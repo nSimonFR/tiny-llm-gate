@@ -56,6 +56,9 @@ func (s *Server) serveGeminiChat(w http.ResponseWriter, r *http.Request, stream 
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	if !s.modelAllowed(w, r, clientModel, res) {
+		return
+	}
 	chain := append([]string{res.ModelName}, res.Fallback...)
 
 	var lastErr error
@@ -107,6 +110,7 @@ func (s *Server) serveGeminiChat(w http.ResponseWriter, r *http.Request, stream 
 		s.logger.Info("served",
 			"request_id", reqID,
 			"frontend", "gemini",
+			"client", clientName(r),
 			"client_model", clientModel,
 			"resolved_model", hop.ModelName,
 			"provider", hop.ProviderName,
@@ -259,6 +263,9 @@ func (s *Server) handleEmbedContent(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	if !s.modelAllowed(w, r, clientModel, res) {
+		return
+	}
 
 	oaReq, err := gemini.EmbedContentToOpenAI(&in, res.UpstreamModel)
 	if err != nil {
@@ -305,6 +312,9 @@ func (s *Server) handleBatchEmbedContents(w http.ResponseWriter, r *http.Request
 	res, err := s.resolver.Resolve(clientModel)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !s.modelAllowed(w, r, clientModel, res) {
 		return
 	}
 
@@ -378,7 +388,11 @@ func (s *Server) handleGeminiModels(w http.ResponseWriter, r *http.Request) {
 		Models []geminiModel `json:"models"`
 	}
 	out := geminiModelList{Models: make([]geminiModel, 0, len(names))}
+	ck := clientOf(r.Context())
 	for _, n := range names {
+		if res, err := s.resolver.Resolve(n); err != nil || !ck.allows(n, res.ModelName, res.Slug) {
+			continue
+		}
 		out.Models = append(out.Models, geminiModel{Name: "models/" + n})
 	}
 	w.Header().Set("Content-Type", "application/json")

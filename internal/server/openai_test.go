@@ -479,8 +479,9 @@ func TestModelsList(t *testing.T) {
 	for i, it := range out.Data {
 		ids[i] = it.ID
 	}
-	if len(ids) != 2 {
-		t.Errorf("expected 2 ids, got %v", ids)
+	want := []string{"gemma4", "gpt-4o", "ollama/gemma4"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Errorf("ids = %v, want %v (sorted, incl. vendor slug)", ids, want)
 	}
 }
 

@@ -219,6 +219,8 @@ type openAIResponse struct {
 	Model   string           `json:"model"`
 	Choices []responseChoice `json:"choices"`
 	Usage   *openAIUsage     `json:"usage,omitempty"`
+	// Always null; strict clients (@openrouter/sdk) require the key.
+	SystemFingerprint *string `json:"system_fingerprint"`
 }
 
 type responseChoice struct {

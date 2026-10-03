@@ -50,6 +50,13 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, upstreamPat
 		s.logger.Warn("read body", "request_id", reqID, "err", err)
 		return
 	}
+	var extraModels []string
+	if upstreamPath == chatPath {
+		if body, extraModels, err = normalizeOpenRouter(body); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 
 	var peek struct {
 		Model  string `json:"model"`
@@ -71,11 +78,11 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, upstreamPat
 			"request_id", reqID, "model", peek.Model, "err", err)
 		return
 	}
+	if !s.modelAllowed(w, r, peek.Model, res) {
+		return
+	}
 
-	// Build the chain of model names to try: primary then fallbacks.
-	chain := make([]string, 0, len(res.Fallback)+1)
-	chain = append(chain, res.ModelName)
-	chain = append(chain, res.Fallback...)
+	chain := s.buildChain(r, res, extraModels)
 
 	var lastErr error
 	for i, name := range chain {
@@ -102,15 +109,7 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, upstreamPat
 		}
 		done, err := s.sendUpstream(w, r, hop, upstreamPath, newBody, peek.Stream, i < len(chain)-1)
 		if done {
-			s.logger.Info("served",
-				"request_id", reqID,
-				"client_model", peek.Model,
-				"resolved_model", hop.ModelName,
-				"provider", hop.ProviderName,
-				"stream", peek.Stream,
-				"fallback_index", i,
-				"latency_ms", time.Since(started).Milliseconds(),
-			)
+			s.logServed(r, "openai", peek.Model, hop, peek.Stream, i, started)
 			return
 		}
 		lastErr = err
@@ -447,51 +446,11 @@ func isWrappedClientError(resp *http.Response) bool {
 func writeJSONError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(struct {
-		Error struct {
-			Message string `json:"message"`
-			Type    string `json:"type"`
-		} `json:"error"`
-	}{
-		Error: struct {
-			Message string `json:"message"`
-			Type    string `json:"type"`
-		}{
-			Message: message,
-			Type:    "tiny_llm_gate_error",
-		},
-	})
-}
-
-// ModelList response for GET /v1/models.
-type modelListResponse struct {
-	Object string          `json:"object"`
-	Data   []modelListItem `json:"data"`
-}
-
-type modelListItem struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
-}
-
-func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-	models := s.resolver.ListModels()
-	resp := modelListResponse{
-		Object: "list",
-		Data:   make([]modelListItem, 0, len(models)),
-	}
-	for _, m := range models {
-		resp.Data = append(resp.Data, modelListItem{
-			ID:      m,
-			Object:  "model",
-			Created: 0,
-			OwnedBy: "tiny-llm-gate",
-		})
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+		"message": message,
+		"type":    "tiny_llm_gate_error",
+		"code":    status, // OpenRouter clients read a numeric code
+	}})
 }
 
 // shouldFallbackStatus keeps the historical 5xx policy unless a model opts

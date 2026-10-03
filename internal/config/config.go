@@ -18,6 +18,45 @@ type Config struct {
 	Aliases    map[string]string    `yaml:"aliases"`
 	MCPBridges map[string]MCPBridge `yaml:"mcp_bridges,omitempty"`
 	Anthropic  *Anthropic           `yaml:"anthropic,omitempty"`
+	// ClientKeys gates the LLM routes behind inbound API keys. Empty keeps
+	// the gate open (any caller, any model).
+	ClientKeys []ClientKey `yaml:"client_keys,omitempty"`
+}
+
+// ClientKey is one inbound credential. Exactly one of Key/KeyFile is set;
+// KeyFile is read once at startup.
+type ClientKey struct {
+	Name    string `yaml:"name"`
+	Key     string `yaml:"key,omitempty"`
+	KeyFile string `yaml:"key_file,omitempty"`
+	// Models is an allowlist: model/alias names, `vendor/model` ids, or
+	// prefix globs ending in `*` (`*` alone = everything). Empty = all.
+	Models []string `yaml:"models,omitempty"`
+	// RPM caps requests per minute (fixed window). 0 = unlimited.
+	RPM int `yaml:"rpm,omitempty"`
+}
+
+// ModelInfo is optional catalog metadata served by GET /v1/models in the
+// OpenRouter shape. Pricing values are USD per token, as strings.
+type ModelInfo struct {
+	Name                string   `yaml:"name,omitempty"`
+	Vendor              string   `yaml:"vendor,omitempty"`
+	Description         string   `yaml:"description,omitempty"`
+	Created             int64    `yaml:"created,omitempty"`
+	ContextLength       int      `yaml:"context_length,omitempty"`
+	MaxOutputTokens     int      `yaml:"max_output_tokens,omitempty"`
+	InputModalities     []string `yaml:"input_modalities,omitempty"`
+	OutputModalities    []string `yaml:"output_modalities,omitempty"`
+	Tokenizer           string   `yaml:"tokenizer,omitempty"`
+	SupportedParameters []string `yaml:"supported_parameters,omitempty"`
+	Pricing             *Pricing `yaml:"pricing,omitempty"`
+}
+
+type Pricing struct {
+	Prompt     string `yaml:"prompt,omitempty" json:"prompt"`
+	Completion string `yaml:"completion,omitempty" json:"completion"`
+	Request    string `yaml:"request,omitempty" json:"request,omitempty"`
+	Image      string `yaml:"image,omitempty" json:"image,omitempty"`
 }
 
 // Anthropic configures the pass-through proxy for Anthropic's /v1/messages
@@ -163,6 +202,17 @@ type Model struct {
 	// otherwise ignores for the `think` field). Valid values are upstream
 	// defined (Ollama: high|medium|low|max|none).
 	ReasoningEffort *string `yaml:"reasoning_effort,omitempty"`
+	// Info is optional catalog metadata; Info.Vendor also names the model's
+	// `vendor/name` id (default: the provider name).
+	Info *ModelInfo `yaml:"info,omitempty"`
+}
+
+// Vendor is the namespace of the model's `vendor/name` id.
+func (m Model) Vendor() string {
+	if m.Info != nil && m.Info.Vendor != "" {
+		return m.Info.Vendor
+	}
+	return m.Provider
 }
 
 // Load reads and validates a YAML config file.
@@ -264,7 +314,43 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
+	return c.validateClientKeys()
+}
+
+func (c *Config) validateClientKeys() error {
+	names := make(map[string]bool, len(c.ClientKeys))
+	for i, k := range c.ClientKeys {
+		if k.Name == "" {
+			return fmt.Errorf("client_keys[%d]: name is required", i)
+		}
+		if names[k.Name] {
+			return fmt.Errorf("client_keys: duplicate name %q", k.Name)
+		}
+		names[k.Name] = true
+		if (k.Key == "") == (k.KeyFile == "") {
+			return fmt.Errorf("client key %q: set exactly one of key or key_file", k.Name)
+		}
+		if k.RPM < 0 {
+			return fmt.Errorf("client key %q: rpm must be >= 0", k.Name)
+		}
+	}
 	return nil
+}
+
+// LoadKey returns the key's secret, reading KeyFile (trimmed) when set.
+func (k ClientKey) LoadKey() (string, error) {
+	if k.KeyFile == "" {
+		return k.Key, nil
+	}
+	b, err := os.ReadFile(k.KeyFile)
+	if err != nil {
+		return "", fmt.Errorf("client key %q: %w", k.Name, err)
+	}
+	s := string(bytes.TrimSpace(b))
+	if s == "" {
+		return "", fmt.Errorf("client key %q: key_file is empty", k.Name)
+	}
+	return s, nil
 }
 
 func (c *Config) validateAnthropic() error {
