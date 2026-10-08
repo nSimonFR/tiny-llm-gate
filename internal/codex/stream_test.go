@@ -235,3 +235,27 @@ func TestStream_ToolCallDeltaByItemID(t *testing.T) {
 		t.Fatalf("args = %q", args)
 	}
 }
+
+func TestStream_ParallelToolCallsArgsOnlyInDone(t *testing.T) {
+	stream := sse(
+		`{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"get_weather"}}`,
+		`{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_b","call_id":"call_b","name":"get_weather"}}`,
+		`{"type":"response.function_call_arguments.done","item_id":"fc_a","arguments":"{\"city\":\"Paris\"}"}`,
+		`{"type":"response.function_call_arguments.done","item_id":"fc_b","arguments":"{\"city\":\"Lyon\"}"}`,
+		`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":1,"output_tokens":1}}}`,
+	)
+	tr := NewTranslator("m")
+	out := &buf{}
+	if _, err := tr.Stream(out, strings.NewReader(stream)); err != nil {
+		t.Fatal(err)
+	}
+	args := map[int]string{}
+	for _, c := range parseChunks(t, out.String()) {
+		for _, tc := range c.Choices[0].Delta.ToolCalls {
+			args[tc.Index] += tc.Function.Arguments
+		}
+	}
+	if args[0] != `{"city":"Paris"}` || args[1] != `{"city":"Lyon"}` {
+		t.Fatalf("args = %q", args)
+	}
+}

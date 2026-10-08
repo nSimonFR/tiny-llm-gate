@@ -104,8 +104,12 @@ func (t *Translator) Stream(dst flusher, src io.Reader) (*openAIUsage, error) {
 				t.writeChunk(dst, t.toolArgsChunk(ta, evt.Delta))
 			}
 		case "response.function_call_arguments.done":
-			// Terminal for a tool call — arguments already streamed via deltas.
-			_ = agg.resolveTool(evt.argCallID(), evt.Name)
+			// Parallel calls can arrive with no deltas, arguments only here.
+			ta := agg.resolveTool(evt.argCallID(), evt.Name)
+			if ta != nil && ta.args.Len() == 0 && evt.Args != "" {
+				ta.args.WriteString(evt.Args)
+				t.writeChunk(dst, t.toolArgsChunk(ta, evt.Args))
+			}
 		case "response.completed", "response.incomplete":
 			if evt.Response != nil && evt.Response.Usage != nil {
 				agg.usage = evt.Response.Usage
