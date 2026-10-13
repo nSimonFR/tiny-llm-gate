@@ -155,7 +155,7 @@ func (req *Request) ToChat(upstreamModel string) ([]byte, error) {
 	}
 	for _, t := range req.Tools {
 		if t.Type != "function" {
-			return nil, fmt.Errorf("%w: tool type %q (only function tools)", ErrUnsupported, t.Type)
+			continue // custom/freeform tools (apply_patch) have no chat equivalent
 		}
 		var ct chatTool
 		ct.Type = "function"
@@ -211,7 +211,7 @@ func (req *Request) inputMessages() ([]chatMessage, error) {
 			}
 		case "function_call_output":
 			out = append(out, chatMessage{Role: "tool", ToolCallID: it.CallID, Content: outputText(it.Output)})
-		case "reasoning":
+		case "reasoning", "additional_tools":
 			// Opaque reasoning state from a prior turn — chat has no slot for it.
 		default:
 			return nil, fmt.Errorf("%w: input item type %q", ErrUnsupported, it.Type)
