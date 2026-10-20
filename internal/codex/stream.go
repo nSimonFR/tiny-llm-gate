@@ -313,6 +313,7 @@ type sseScanner struct {
 	block strings.Builder
 	cur   codexEvent
 	curOK bool
+	raw   string
 	rerr  error
 }
 
@@ -365,6 +366,7 @@ func (s *sseScanner) parseBlock(block string) {
 		}
 	}
 	raw := data.String()
+	s.raw = raw
 	if raw == "" || raw == "[DONE]" {
 		return
 	}

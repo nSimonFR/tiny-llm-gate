@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -106,8 +107,9 @@ func upstreamError(resp *http.Response) string {
 	return oaichat.ErrorMessage(b)
 }
 
-// handleResponses serves POST /v1/responses (OpenAI Responses API) for every
-// provider type, via the chat core.
+// handleResponses serves POST /v1/responses (OpenAI Responses API). Codex hops
+// are forwarded natively; any other hop, and every hop after it, goes through
+// the chat core.
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	body, err := readBoundedBody(r)
@@ -115,24 +117,67 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	var peek struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+	}
+	if err := json.Unmarshal(body, &peek); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if peek.Model == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing 'model' field")
+		return
+	}
+	res, err := s.resolver.Resolve(peek.Model)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !s.modelAllowed(w, r, peek.Model, res) {
+		return
+	}
+	chain := append([]string{res.ModelName}, res.Fallback...)
+
+	var lastErr error
+	for i, name := range chain {
+		hop, err := s.resolver.Resolve(name)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if hop.Provider.Type != "codex" {
+			s.serveResponsesTranslated(w, r, body, peek.Model, chain[i:], i, started)
+			return
+		}
+		done, retryable, err := s.serveCodexResponses(w, r, hop, body, peek.Stream, i < len(chain)-1)
+		if done {
+			s.logServed(r, "responses", peek.Model, hop, peek.Stream, i, started)
+			return
+		}
+		switch {
+		case errors.Is(err, context.Canceled):
+			return
+		case errors.Is(err, errBuild):
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		case !retryable:
+			writeJSONError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		lastErr = err
+	}
+	writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("all upstreams failed: %v", lastErr))
+}
+
+// serveResponsesTranslated runs the remaining chain through the chat core.
+// offset is the chain index of chain[0], for the fallback_index log field.
+func (s *Server) serveResponsesTranslated(w http.ResponseWriter, r *http.Request, body []byte, clientModel string, chain []string, offset int, started time.Time) {
 	req, err := responses.Parse(body)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Model == "" {
-		writeJSONError(w, http.StatusBadRequest, "missing 'model' field")
-		return
-	}
-	res, err := s.resolver.Resolve(req.Model)
-	if err != nil {
-		writeJSONError(w, http.StatusNotFound, err.Error())
-		return
-	}
-	if !s.modelAllowed(w, r, req.Model, res) {
-		return
-	}
-	chain := append([]string{res.ModelName}, res.Fallback...)
 	resp, hop, idx, err := s.chatChain(r, chain, func(hop *resolve.Resolved) ([]byte, error) {
 		return req.ToChat(hop.UpstreamModel)
 	})
@@ -154,9 +199,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if req.Stream {
 		sink = flushWriter{w}
 	}
-	relay(w, resp, req.Stream, responses.NewEncoder(sink, req, req.Model),
+	relay(w, resp, req.Stream, responses.NewEncoder(sink, req, clientModel),
 		func(code int, msg string) { writeJSONError(w, code, msg) })
-	s.logServed(r, "responses", req.Model, hop, req.Stream, idx, started)
+	s.logServed(r, "responses", clientModel, hop, req.Stream, offset+idx, started)
 }
 
 // serveMessagesTranslated answers /v1/messages for a non-Anthropic model.
