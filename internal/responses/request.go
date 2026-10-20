@@ -49,6 +49,7 @@ type inputItem struct {
 	CallID    string          `json:"call_id"`
 	Name      string          `json:"name"`
 	Arguments string          `json:"arguments"`
+	Input     string          `json:"input"`
 	Output    json.RawMessage `json:"output"`
 }
 
@@ -199,20 +200,26 @@ func (req *Request) inputMessages() ([]chatMessage, error) {
 				return nil, err
 			}
 			out = append(out, chatMessage{Role: role, Content: content})
-		case "function_call":
+		case "function_call", "custom_tool_call":
 			var call chatCall
 			call.ID, call.Type = it.CallID, "function"
 			call.Function.Name, call.Function.Arguments = it.Name, it.Arguments
+			if it.Type == "custom_tool_call" {
+				// Freeform input; chat only knows JSON arguments.
+				args, _ := json.Marshal(map[string]string{"input": it.Input})
+				call.Function.Arguments = string(args)
+			}
 			// A turn's text item and its calls fold into one assistant message.
 			if n := len(out); n > 0 && out[n-1].Role == "assistant" {
 				out[n-1].ToolCalls = append(out[n-1].ToolCalls, call)
 			} else {
 				out = append(out, chatMessage{Role: "assistant", ToolCalls: []chatCall{call}})
 			}
-		case "function_call_output":
+		case "function_call_output", "custom_tool_call_output":
 			out = append(out, chatMessage{Role: "tool", ToolCallID: it.CallID, Content: outputText(it.Output)})
 		case "reasoning", "additional_tools":
-			// Opaque reasoning state from a prior turn — chat has no slot for it.
+			// Opaque reasoning state, and codex tool layouts chat cannot express.
+			// Codex hops never get here: they take the native Responses path.
 		default:
 			return nil, fmt.Errorf("%w: input item type %q", ErrUnsupported, it.Type)
 		}

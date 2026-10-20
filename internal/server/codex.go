@@ -54,6 +54,35 @@ func (s *Server) codexUpstream(
 		return nil, canRetry, fmt.Errorf("codex translate: %w", err)
 	}
 
+	up, retryable, err := s.codexPost(r, hop, codexBody, canRetry)
+	if up == nil || up.StatusCode < 200 || up.StatusCode >= 300 {
+		return up, retryable, err
+	}
+
+	tr := codex.NewTranslator(hop.ModelName)
+
+	if !isStream {
+		out, cerr := tr.Collect(up.Body)
+		up.Body.Close()
+		if cerr != nil {
+			return nil, canRetry, fmt.Errorf("codex translate: %w", cerr)
+		}
+		return synthOpenAIResponse(false, io.NopCloser(bytes.NewReader(out))), false, nil
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		defer up.Body.Close()
+		_, serr := tr.Stream(pipeFlusher{pw}, up.Body)
+		pw.CloseWithError(serr)
+	}()
+	return synthOpenAIResponse(true, pr), false, nil
+}
+
+// codexPost POSTs a Codex Responses body to the ChatGPT backend with the
+// desktop fingerprint + OAuth auth. Same return contract as chatUpstream; a
+// non-2xx response comes back unread for the caller to forward.
+func (s *Server) codexPost(r *http.Request, hop *resolve.Resolved, codexBody []byte, canRetry bool) (*http.Response, bool, error) {
 	url := strings.TrimRight(hop.Provider.BaseURL, "/") + "/responses"
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(codexBody))
 	if err != nil {
@@ -90,28 +119,7 @@ func (s *Server) codexUpstream(
 		up.Body.Close()
 		return nil, true, fmt.Errorf("codex upstream status %d", up.StatusCode)
 	}
-	if up.StatusCode < 200 || up.StatusCode >= 300 {
-		return up, false, nil
-	}
-
-	tr := codex.NewTranslator(hop.ModelName)
-
-	if !isStream {
-		out, cerr := tr.Collect(up.Body)
-		up.Body.Close()
-		if cerr != nil {
-			return nil, canRetry, fmt.Errorf("codex translate: %w", cerr)
-		}
-		return synthOpenAIResponse(false, io.NopCloser(bytes.NewReader(out))), false, nil
-	}
-
-	pr, pw := io.Pipe()
-	go func() {
-		defer up.Body.Close()
-		_, serr := tr.Stream(pipeFlusher{pw}, up.Body)
-		pw.CloseWithError(serr)
-	}()
-	return synthOpenAIResponse(true, pr), false, nil
+	return up, false, nil
 }
 
 func randomUUID() string {
