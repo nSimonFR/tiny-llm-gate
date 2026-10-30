@@ -52,8 +52,9 @@ const maxUsageBench = 6 * time.Hour
 // round-robin was rejected — alternating every request risks rate-limiting
 // multiple accounts at once and more closely resembles ToS-gaming.
 type anthropicAccount struct {
-	name string
-	auth auth.Authenticator
+	name  string
+	email string
+	auth  auth.Authenticator
 	// coolingDownUntil is a unix-seconds deadline; zero (or past) means
 	// available. Set on a 429 (rate limit) or 401/403 (auth failure) from
 	// this account's upstream request.

@@ -98,6 +98,9 @@ client_keys:                # optional; when set, every LLM route needs a key
     models: ["openai/*"]    # optional allowlist (names, slugs, prefix*)
     rpm: 60                 # optional requests/minute
 
+management:                 # optional; serves /v0/management for usage hubs
+  key_file: /run/secrets/tlg-management   # or key: <string>
+
 ```
 
 See [`testdata/example-config.yaml`](testdata/example-config.yaml) for a fuller example.
@@ -116,10 +119,15 @@ See [`testdata/example-config.yaml`](testdata/example-config.yaml) for a fuller 
 | POST   | `/v1beta/models/{m}:streamGenerateContent` | Gemini chat, streaming (newline-delimited JSON) |
 | POST   | `/v1beta/models/{m}:embedContent`          | Gemini single-item embedding |
 | POST   | `/v1beta/models/{m}:batchEmbedContents`    | Gemini batch embedding |
+| GET    | `/v0/management/auth-files` | Subscription accounts (`anthropic.accounts`, `oauth_chatgpt` providers), when `management:` is set |
+| POST   | `/v0/management/api-call`   | Relay a usage request to `api.anthropic.com` / `chatgpt.com` with one account's token |
+| POST   | `/v0/management/reset-quota` | Lift the gate's cooldown on an account |
 | GET    | `/health`              | liveness |
 | GET    | `/ready`               | readiness (config loaded) |
 
 Every `/v1/...` route above is also served at `/api/v1/...` (OpenRouter's base path).
+
+The `/v0/management` routes are the subset of CLIProxyAPI's management API that usage dashboards read, so the gate can be added as a CLIProxyAPI hub (e.g. T3 Code: **Settings → Providers → Usage providers → Add hub**, URL `http://<host>:4001`, the management key). They take the management key, not a client key. The tokens never leave the gate: `api-call` only reaches the Anthropic and ChatGPT hosts and fills the account's credentials itself. Set `email:` on an `anthropic.accounts` entry so the hub can match it with the same account signed in elsewhere; Codex emails come from the token.
 
 Gemini requests are transparently translated to OpenAI format before being forwarded to the upstream — you can point an AFFiNE Gemini provider at this gateway and route to an Ollama backend.
 
