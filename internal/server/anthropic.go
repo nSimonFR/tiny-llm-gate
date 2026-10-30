@@ -62,6 +62,9 @@ type anthropicAccount struct {
 	// usageCheckInFlight serializes benchIfExhausted lookups so a burst of
 	// concurrent 429s doesn't stampede the usage endpoint.
 	usageCheckInFlight atomic.Bool
+	// profileEmail caches the email Anthropic reports for this account's
+	// token, looked up once for the management API when email is unset.
+	profileEmail atomic.Pointer[string]
 }
 
 func (a *anthropicAccount) available(now time.Time) bool {
