@@ -34,6 +34,8 @@ const (
 	// tokenPlaceholder marks header values the hub expects the gate to fill
 	// with the account's token. The account's authenticator sets them instead.
 	tokenPlaceholder = "$TOKEN$"
+	// profilePath is Anthropic's OAuth profile endpoint, relative to the API root.
+	profilePath = "/api/oauth/profile"
 )
 
 // managedAccount is one subscription account exposed on the management API.
@@ -112,9 +114,12 @@ type authFile struct {
 	IDToken   *authFileIDToken `json:"id_token,omitempty"`
 }
 
-func (s *Server) handleAuthFiles(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleAuthFiles(w http.ResponseWriter, r *http.Request) {
 	files := []authFile{}
 	for _, a := range s.managedAccounts() {
+		if a.claude != nil && a.email == "" {
+			a.email = s.claudeProfileEmail(r.Context(), a.claude)
+		}
 		f := authFile{ID: a.index, AuthIndex: a.index, Provider: a.provider, Email: a.email}
 		if a.chatGPTAccountID != "" || a.plan != "" {
 			f.IDToken = &authFileIDToken{ChatGPTAccountID: a.chatGPTAccountID, ChatGPTPlanType: a.plan}
@@ -122,6 +127,47 @@ func (s *Server) handleAuthFiles(w http.ResponseWriter, _ *http.Request) {
 		files = append(files, f)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"files": files})
+}
+
+// claudeProfileEmail returns the email Anthropic's OAuth profile reports for
+// an account, so hubs can match it with the same account signed in elsewhere
+// without the address living in config. Successes are cached for the process;
+// a failure (e.g. a rate-limited token) returns "" and is retried next time.
+func (s *Server) claudeProfileEmail(ctx context.Context, a *anthropicAccount) string {
+	if cached := a.profileEmail.Load(); cached != nil {
+		return *cached
+	}
+	ctx, cancel := context.WithTimeout(ctx, managementTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		strings.TrimRight(s.cfg.Anthropic.Upstream, "/")+profilePath, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	if err := a.auth.Apply(ctx, req); err != nil {
+		return ""
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		s.logger.Warn("management: claude profile lookup failed", "account", a.name, "status", resp.StatusCode)
+		return ""
+	}
+	var profile struct {
+		Account struct {
+			Email string `json:"email"`
+		} `json:"account"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, managementMaxBody)).Decode(&profile); err != nil || profile.Account.Email == "" {
+		return ""
+	}
+	email := profile.Account.Email
+	a.profileEmail.Store(&email)
+	return email
 }
 
 type apiCallRequest struct {

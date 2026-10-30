@@ -127,7 +127,7 @@ See [`testdata/example-config.yaml`](testdata/example-config.yaml) for a fuller 
 
 Every `/v1/...` route above is also served at `/api/v1/...` (OpenRouter's base path).
 
-The `/v0/management` routes are the subset of CLIProxyAPI's management API that usage dashboards read, so the gate can be added as a CLIProxyAPI hub (e.g. T3 Code: **Settings → Providers → Usage providers → Add hub**, URL `http://<host>:4001`, the management key). They take the management key, not a client key. The tokens never leave the gate: `api-call` only reaches the Anthropic and ChatGPT hosts and fills the account's credentials itself. Set `email:` on an `anthropic.accounts` entry so the hub can match it with the same account signed in elsewhere; Codex emails come from the token.
+The `/v0/management` routes are the subset of CLIProxyAPI's management API that usage dashboards read, so the gate can be added as a CLIProxyAPI hub (e.g. T3 Code: **Settings → Providers → Usage providers → Add hub**, URL `http://<host>:4001`, the management key). They take the management key, not a client key. The tokens never leave the gate: `api-call` only reaches the Anthropic and ChatGPT hosts and fills the account's credentials itself. Account emails let the hub match an account signed in elsewhere: Codex reads it from the token, Claude asks Anthropic's OAuth profile once (or set `email:` on the `anthropic.accounts` entry).
 
 Gemini requests are transparently translated to OpenAI format before being forwarded to the upstream — you can point an AFFiNE Gemini provider at this gateway and route to an Ollama backend.
 

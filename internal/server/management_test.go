@@ -216,3 +216,37 @@ func TestManagementResetQuotaClearsCooldown(t *testing.T) {
 		t.Error("account still cooling down")
 	}
 }
+
+func TestManagementAuthFilesLooksUpClaudeEmail(t *testing.T) {
+	var calls int
+	status := http.StatusTooManyRequests
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != profilePath || r.Header.Get("Authorization") != "Bearer claude-work-token" {
+			t.Errorf("unexpected request %s auth=%q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		calls++
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"account":{"email":"profile@example.com"}}`))
+	}))
+	defer upstream.Close()
+	s := buildManagementServer(t, upstream)
+	s.anthropicAccounts[0].email = ""
+	h := s.Handler()
+
+	claudeEmail := func() string {
+		rec := managementRequest(t, h, http.MethodGet, "/v0/management/auth-files", testManagementKey, nil)
+		var got struct{ Files []authFile }
+		_ = json.Unmarshal(rec.Body.Bytes(), &got)
+		return got.Files[0].Email
+	}
+	if got := claudeEmail(); got != "" {
+		t.Errorf("rate-limited lookup: email %q, want none", got)
+	}
+	status = http.StatusOK
+	if got := claudeEmail(); got != "profile@example.com" {
+		t.Errorf("email %q after recovery", got)
+	}
+	if got := claudeEmail(); got != "profile@example.com" || calls != 2 {
+		t.Errorf("cached email %q, %d upstream calls, want 2", got, calls)
+	}
+}
