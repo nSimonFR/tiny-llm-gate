@@ -21,6 +21,24 @@ type Config struct {
 	// ClientKeys gates the LLM routes behind inbound API keys. Empty keeps
 	// the gate open (any caller, any model).
 	ClientKeys []ClientKey `yaml:"client_keys,omitempty"`
+	// Management exposes the subscription accounts (anthropic.accounts and
+	// oauth_chatgpt providers) through a CLIProxyAPI-compatible
+	// /v0/management API, so T3 Code can add the gate as a usage hub. Unset
+	// keeps the routes unregistered.
+	Management *Management `yaml:"management,omitempty"`
+}
+
+// Management is the credential for the /v0/management routes. Exactly one of
+// Key/KeyFile is set; KeyFile is read once at startup. It is separate from
+// client_keys because it can read every account's quota.
+type Management struct {
+	Key     string `yaml:"key,omitempty"`
+	KeyFile string `yaml:"key_file,omitempty"`
+}
+
+// LoadKey returns the management secret, reading KeyFile (trimmed) when set.
+func (m Management) LoadKey() (string, error) {
+	return ClientKey{Name: "management", Key: m.Key, KeyFile: m.KeyFile}.LoadKey()
 }
 
 // ClientKey is one inbound credential. Exactly one of Key/KeyFile is set;
@@ -101,6 +119,9 @@ type AnthropicAccount struct {
 	// within Accounts.
 	Name string `yaml:"name"`
 	Auth *Auth  `yaml:"auth"`
+	// Email labels the account on the management API so usage hubs can
+	// match it with the same account signed in elsewhere. Optional.
+	Email string `yaml:"email,omitempty"`
 }
 
 // EffectiveAccounts normalizes the Anthropic config into an ordered account
@@ -313,6 +334,9 @@ func (c *Config) validate() error {
 		if err := c.validateAnthropic(); err != nil {
 			return err
 		}
+	}
+	if m := c.Management; m != nil && (m.Key == "") == (m.KeyFile == "") {
+		return errors.New("management: set exactly one of key or key_file")
 	}
 	return c.validateClientKeys()
 }

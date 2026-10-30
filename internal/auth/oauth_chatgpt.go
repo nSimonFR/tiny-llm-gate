@@ -112,6 +112,35 @@ func (c *ChatGPTOAuth) Apply(ctx context.Context, req *http.Request) error {
 	return nil
 }
 
+// Identity reports the ChatGPT account behind the current tokens, read from
+// the unverified id/access token claims. Empty fields are unknown.
+func (c *ChatGPTOAuth) Identity() (accountID, email, plan string) {
+	c.mu.RLock()
+	access, id, acct := c.accessToken, c.idToken, c.accountID
+	c.mu.RUnlock()
+	if acct == "" {
+		acct = accountIDFromJWT(access)
+	}
+	for _, tok := range []string{id, access} {
+		claims := jwtClaims(tok)
+		if claims == nil {
+			continue
+		}
+		if email == "" {
+			if e, ok := claims["email"].(string); ok {
+				email = e
+			}
+			if profile, ok := claims["https://api.openai.com/profile"].(map[string]any); ok && email == "" {
+				email, _ = profile["email"].(string)
+			}
+		}
+		if authClaim, ok := claims["https://api.openai.com/auth"].(map[string]any); ok && plan == "" {
+			plan, _ = authClaim["chatgpt_plan_type"].(string)
+		}
+	}
+	return acct, email, plan
+}
+
 // credentialFile is the on-disk credential layout. It accepts both a flat
 // shape ({access_token, refresh_token, ...}) and the nested shape written by
 // the Codex CLI / openai-oauth ({tokens:{access_token, ...}, last_refresh}),

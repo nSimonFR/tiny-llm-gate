@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"net"
@@ -52,6 +53,9 @@ type Server struct {
 	currentAnthropic atomic.Int32
 	// clientKeys indexes inbound keys by SHA-256; empty = open gate.
 	clientKeys map[[32]byte]*clientKey
+	// managementKey is the SHA-256 of the /v0/management secret; nil when
+	// management is not configured.
+	managementKey *[32]byte
 }
 
 // New builds a Server. The *http.Client has generous timeouts for streaming
@@ -123,7 +127,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 			if err != nil {
 				return nil, fmt.Errorf("anthropic account %q: auth: %w", ac.Name, err)
 			}
-			anthropicAccounts = append(anthropicAccounts, &anthropicAccount{name: ac.Name, auth: authn})
+			anthropicAccounts = append(anthropicAccounts, &anthropicAccount{name: ac.Name, email: ac.Email, auth: authn})
 		}
 		for model, route := range cfg.Anthropic.Routes {
 			authn, err := auth.Build(authConfigFromConfig(route.Auth, logger))
@@ -149,6 +153,16 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		return nil, err
 	}
 
+	var managementKey *[32]byte
+	if cfg.Management != nil {
+		secret, err := cfg.Management.LoadKey()
+		if err != nil {
+			return nil, err
+		}
+		h := sha256.Sum256([]byte(secret))
+		managementKey = &h
+	}
+
 	return &Server{
 		cfg:        cfg,
 		resolver:   resolver,
@@ -163,6 +177,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		anthropicAccounts:  anthropicAccounts,
 		anthropicRoutes:    anthropicRoutes,
 		anthropicRouteKeys: anthropicRouteKeys,
+		managementKey:      managementKey,
 	}, nil
 }
 
@@ -251,6 +266,12 @@ func (s *Server) Handler() http.Handler {
 	// action in a single handler.
 	mux.HandleFunc("GET /v1beta/models", s.guard(s.handleGeminiModels))
 	mux.HandleFunc("POST /v1beta/models/", s.guard(s.routeGemini))
+
+	if s.managementKey != nil {
+		mux.HandleFunc("GET /v0/management/auth-files", s.management(s.handleAuthFiles))
+		mux.HandleFunc("POST /v0/management/api-call", s.management(s.handleAPICall))
+		mux.HandleFunc("POST /v0/management/reset-quota", s.management(s.handleResetQuota))
+	}
 
 	// Health and readiness
 	mux.HandleFunc("GET /health", s.handleHealth)

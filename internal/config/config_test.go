@@ -140,6 +140,20 @@ providers:
 models:
   m: { provider: p, upstream_model: m, fallback: ["missing"] }
 `,
+		"management without a key": `
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+management: {}
+`,
+		"management with key and key_file": `
+providers:
+  p: { type: openai, base_url: http://x }
+models:
+  m: { provider: p, upstream_model: m }
+management: { key: a, key_file: /tmp/k }
+`,
 		"self-fallback": `
 providers:
   p: { type: openai, base_url: http://x }
