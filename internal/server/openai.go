@@ -14,9 +14,13 @@ import (
 	"github.com/nSimonFR/tiny-llm-gate/internal/resolve"
 )
 
-// Maximum request body size. Generous for batch embeddings but small enough
-// to prevent a single request from blowing the memory budget.
-const maxRequestBytes = 8 * 1024 * 1024 // 8 MiB
+// Request body caps. 8 MiB is generous for batch embeddings yet keeps one
+// request from blowing the memory budget. Messages gets Anthropic's own 32 MB
+// limit: a long Claude Code session with screenshots outgrows 8 MiB.
+const (
+	maxRequestBytes         = 8 << 20
+	maxMessagesRequestBytes = 32 << 20
+)
 
 // chatCompletionsPath is appended to the provider's base_url.
 const (
@@ -44,9 +48,9 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, upstreamPat
 	started := time.Now()
 	reqID := requestID(r.Context())
 
-	body, err := readBoundedBody(r)
+	body, err := readBoundedBody(r, maxRequestBytes)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		writeJSONError(w, bodyErrorStatus(err), err.Error())
 		s.logger.Warn("read body", "request_id", reqID, "err", err)
 		return
 	}
@@ -277,13 +281,29 @@ func drain(r io.Reader) {
 	_, _ = io.Copy(io.Discard, r)
 }
 
-func readBoundedBody(r *http.Request) ([]byte, error) {
-	r.Body = http.MaxBytesReader(nil, r.Body, maxRequestBytes)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
+func readBoundedBody(r *http.Request, limit int64) ([]byte, error) {
+	if r.ContentLength > limit {
+		return nil, fmt.Errorf("read body: %w", &http.MaxBytesError{Limit: limit})
+	}
+	r.Body = http.MaxBytesReader(nil, r.Body, limit)
+	// Sized from Content-Length: io.ReadAll's doubling peaks near twice the body.
+	var buf bytes.Buffer
+	if r.ContentLength > 0 {
+		buf.Grow(int(r.ContentLength) + bytes.MinRead)
+	}
+	if _, err := buf.ReadFrom(r.Body); err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
-	return body, nil
+	return buf.Bytes(), nil
+}
+
+// bodyErrorStatus is 413 for a body over its cap, 400 for any other read error.
+func bodyErrorStatus(err error) int {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
 }
 
 // rewriteModelField produces a new JSON body with the "model" field replaced.

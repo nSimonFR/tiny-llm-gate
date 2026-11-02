@@ -242,9 +242,12 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	started := time.Now()
 	reqID := requestID(r.Context())
 
-	body, err := readBoundedBody(r)
+	body, err := readBoundedBody(r, maxMessagesRequestBytes)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		status := bodyErrorStatus(err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(messages.ErrorBody(messages.ErrorType(status), err.Error()))
 		s.logger.Warn("anthropic: read body", "request_id", reqID, "err", err)
 		return
 	}

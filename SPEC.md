@@ -888,8 +888,11 @@ other workloads. The gateway is configured to live in ~30 MB RSS.
   reliable streaming; see §4.6).
 - MCP-bridge HTTP client: longer timeouts (idle 90s, response-header 120s),
   smaller idle pool (8 / 2).
-- Request body cap: **8 MiB** for LLM frontends. MCP message bodies are
-  capped at **1 MiB**.
+- Request body cap: **8 MiB** for LLM frontends, **32 MiB** for
+  `/v1/messages` (Anthropic's own limit; long Claude Code sessions with
+  images exceed 8 MiB). The read buffer is pre-sized from `Content-Length`,
+  so peak memory is about one body, not two. MCP message bodies are capped
+  at **1 MiB**.
 - Streaming reads use a small buffer (4 KiB in the reference
   implementation) with explicit flush per chunk.
 - Gemini non-streaming upstream response read is limited to 4 MiB; embedding
@@ -932,7 +935,7 @@ memory-budget knob that runtime exposes.
 | `auth.token_file` deleted post-startup | next request returns 5xx with read error |
 | Unknown `model` in inbound request | 404 `{"error":{"message":"unknown model ..."}}` |
 | Alias cycle | 404 (resolver error surfaces via the same path) |
-| Inbound body > 8 MiB | 400 from request-size enforcement |
+| Inbound body over its cap | 413; `request_too_large` Anthropic error on `/v1/messages` |
 | Inbound body invalid JSON | 400 `"invalid JSON body"` |
 | Inbound body missing `model` | 400 `"missing 'model' field"` (OpenAI/Gemini) |
 | Upstream 5xx, fallback available | retry next hop |
@@ -997,7 +1000,7 @@ broken.
    typos that caused production routing failures. New fields must be added
    to the schema *before* shipping a config that uses them.
 
-7. **Inbound body cap is 8 MiB; MCP body cap is 1 MiB.** Both are
+7. **Inbound body cap is 8 MiB (32 MiB for `/v1/messages`); MCP body cap is 1 MiB.** All are
    conservative; raising them needs a corresponding memory-budget review
    on the reference RPi5 target.
 

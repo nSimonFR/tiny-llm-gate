@@ -112,9 +112,9 @@ func upstreamError(resp *http.Response) string {
 // the chat core.
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	body, err := readBoundedBody(r)
+	body, err := readBoundedBody(r, maxRequestBytes)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		writeJSONError(w, bodyErrorStatus(err), err.Error())
 		return
 	}
 	var peek struct {

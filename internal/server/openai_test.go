@@ -587,3 +587,16 @@ func makeTestJWT(expOffsetSec int64) string {
 	)
 	return header + "." + body + ".sig"
 }
+
+func TestChatCompletionsOverCapIs413(t *testing.T) {
+	s := buildServer(t,
+		map[string]config.Provider{"p": {Type: "openai", BaseURL: "http://localhost:1/v1"}},
+		map[string]config.Model{"m": {Provider: "p", UpstreamModel: "m"}}, nil)
+	body := `{"model":"m","messages":[{"role":"user","content":"` + strings.Repeat("a", maxRequestBytes) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413 (%s)", rec.Code, rec.Body.String())
+	}
+}
