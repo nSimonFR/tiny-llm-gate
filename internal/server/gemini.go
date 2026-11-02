@@ -40,9 +40,9 @@ func (s *Server) serveGeminiChat(w http.ResponseWriter, r *http.Request, stream 
 		return
 	}
 
-	body, err := readBoundedBody(r)
+	body, err := readBoundedBody(r, maxRequestBytes)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		writeJSONError(w, bodyErrorStatus(err), err.Error())
 		return
 	}
 	var in gemini.ChatRequest
@@ -247,9 +247,9 @@ func (s *Server) handleEmbedContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := readBoundedBody(r)
+	body, err := readBoundedBody(r, maxRequestBytes)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		writeJSONError(w, bodyErrorStatus(err), err.Error())
 		return
 	}
 	var in gemini.EmbedContentRequest
@@ -298,9 +298,9 @@ func (s *Server) handleBatchEmbedContents(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	body, err := readBoundedBody(r)
+	body, err := readBoundedBody(r, maxRequestBytes)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, err.Error())
+		writeJSONError(w, bodyErrorStatus(err), err.Error())
 		return
 	}
 	var in gemini.BatchEmbedContentsRequest

@@ -139,7 +139,7 @@ Gemini requests are transparently translated to OpenAI format before being forwa
 | RSS idle    | **6.9 MiB** measured |
 | Runtime deps | `gopkg.in/yaml.v3` only |
 | HTTP client | stdlib `net/http`, bounded idle pool, HTTP/2 disabled for predictable streaming |
-| Request body cap | 8 MiB |
+| Request body cap | 8 MiB (32 MiB for `/v1/messages`) |
 | GOMEMLIMIT (recommended) | `20MiB` |
 | MemoryMax (systemd, recommended) | `30M` |
 

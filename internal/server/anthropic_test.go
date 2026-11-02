@@ -731,3 +731,76 @@ func TestAnthropicBodyPassesThroughUnchanged(t *testing.T) {
 		t.Errorf("temperature lost: %v", parsed["temperature"])
 	}
 }
+
+// messagesBody is a JSON Messages request padded to roughly n bytes.
+func messagesBody(n int) []byte {
+	return []byte(`{"model":"claude-x","max_tokens":1,"messages":[{"role":"user","content":"` +
+		strings.Repeat("a", n) + `"}]}`)
+}
+
+func TestAnthropicMessagesAcceptsBodyOverGenericCap(t *testing.T) {
+	var gotLen int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotLen = len(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message"}`))
+	}))
+	defer upstream.Close()
+	s := buildAnthropicServer(t, upstream.URL, "")
+
+	body := messagesBody(maxRequestBytes + 1<<20)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gotLen != len(body) {
+		t.Fatalf("upstream got %d bytes, want %d", gotLen, len(body))
+	}
+}
+
+func TestAnthropicMessagesOverCapIs413RequestTooLarge(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		chunked bool
+	}{{"content-length", false}, {"chunked", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+			}))
+			defer upstream.Close()
+			s := buildAnthropicServer(t, upstream.URL, "")
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(messagesBody(maxMessagesRequestBytes)))
+			if tc.chunked {
+				req.ContentLength = -1
+			}
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %d, want 413", rec.Code)
+			}
+			var got struct {
+				Type  string `json:"type"`
+				Error struct {
+					Type string `json:"type"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+			}
+			if got.Type != "error" || got.Error.Type != "request_too_large" {
+				t.Fatalf("body = %s, want an Anthropic request_too_large error", rec.Body.String())
+			}
+			if called {
+				t.Fatal("over-cap request reached upstream")
+			}
+		})
+	}
+}
