@@ -26,6 +26,24 @@ type Config struct {
 	// /v0/management API, so T3 Code can add the gate as a usage hub. Unset
 	// keeps the routes unregistered.
 	Management *Management `yaml:"management,omitempty"`
+	// CodexCatalog serves GET /codex/models in Codex CLI's own catalog format,
+	// so a Codex model provider can point model_catalog_url at the gate and
+	// list exactly these models. Unset keeps the route unregistered.
+	CodexCatalog *CodexCatalog `yaml:"codex_catalog,omitempty"`
+}
+
+// CodexCatalog picks the models Codex CLI may list. Entries are cloned from
+// the upstream ChatGPT catalog fetched through Provider (a codex provider), so
+// each keeps its instructions and tool settings, then renamed to the gate id.
+type CodexCatalog struct {
+	Provider string `yaml:"provider"`
+	// Models are gate model or alias names, in picker order.
+	Models []string `yaml:"models"`
+	// Template is the upstream slug cloned for a model the upstream catalog
+	// does not list (non-codex providers). Empty = the first upstream entry.
+	Template string `yaml:"template,omitempty"`
+	// ClientVersion is sent upstream when the caller sends none.
+	ClientVersion string `yaml:"client_version,omitempty"`
 }
 
 // Management is the credential for the /v0/management routes. Exactly one of
@@ -338,6 +356,9 @@ func (c *Config) validate() error {
 	if m := c.Management; m != nil && (m.Key == "") == (m.KeyFile == "") {
 		return errors.New("management: set exactly one of key or key_file")
 	}
+	if err := c.validateCodexCatalog(); err != nil {
+		return err
+	}
 	return c.validateClientKeys()
 }
 
@@ -478,6 +499,32 @@ func (p Provider) EffectiveAuth() *Auth {
 	}
 	if p.APIKey != "" {
 		return &Auth{Type: "bearer", Token: p.APIKey}
+	}
+	return nil
+}
+
+func (c *Config) validateCodexCatalog() error {
+	cc := c.CodexCatalog
+	if cc == nil {
+		return nil
+	}
+	if p, ok := c.Providers[cc.Provider]; !ok || p.Type != "codex" {
+		return fmt.Errorf("codex_catalog: provider %q must be a codex provider", cc.Provider)
+	}
+	if len(cc.Models) == 0 {
+		return errors.New("codex_catalog: models is empty")
+	}
+	seen := map[string]bool{}
+	for _, m := range cc.Models {
+		_, isModel := c.Models[m]
+		_, isAlias := c.Aliases[m]
+		if !isModel && !isAlias {
+			return fmt.Errorf("codex_catalog: %q is not a model or alias", m)
+		}
+		if seen[m] {
+			return fmt.Errorf("codex_catalog: %q listed twice", m)
+		}
+		seen[m] = true
 	}
 	return nil
 }
