@@ -18,6 +18,7 @@ import (
 	"github.com/nSimonFR/tiny-llm-gate/internal/config"
 	"github.com/nSimonFR/tiny-llm-gate/internal/mcp"
 	"github.com/nSimonFR/tiny-llm-gate/internal/resolve"
+	"github.com/nSimonFR/tiny-llm-gate/internal/router"
 )
 
 // Server is the public type exposed to main.
@@ -57,6 +58,7 @@ type Server struct {
 	// management is not configured.
 	managementKey *[32]byte
 	codexCatalog  codexCatalogCache
+	routers       map[string]*router.Router
 }
 
 // New builds a Server. The *http.Client has generous timeouts for streaming
@@ -164,13 +166,15 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		managementKey = &h
 	}
 
+	// No overall Timeout — streaming responses can legitimately run for
+	// minutes. Per-phase timeouts live on the Transport.
+	client := &http.Client{Transport: transport}
 	return &Server{
-		cfg:        cfg,
-		resolver:   resolver,
-		clientKeys: clientKeys,
-		// No overall Timeout — streaming responses can legitimately run
-		// for minutes. Per-phase timeouts live on the Transport.
-		client:             &http.Client{Transport: transport},
+		cfg:                cfg,
+		resolver:           resolver,
+		clientKeys:         clientKeys,
+		client:             client,
+		routers:            buildRouters(cfg, client, logger),
 		logger:             logger,
 		auths:              auths,
 		disabled:           disabled,

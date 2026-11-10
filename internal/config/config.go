@@ -35,6 +35,81 @@ type Config struct {
 	// DiscoverInterval is how often discovering providers are re-polled
 	// (Go duration). Default 10m.
 	DiscoverInterval string `yaml:"discover_interval,omitempty"`
+	// Routers are virtual models: each user turn, a classifier picks which of
+	// the router's tiers serves the request.
+	Routers map[string]Router `yaml:"routers,omitempty"`
+}
+
+// Router is a virtual model that asks a decision model (TypeSafe Jev) a few
+// yes/no questions once per user turn, then serves the turn on the cheapest
+// tier no fired question escalates past.
+type Router struct {
+	Classifier RouterClassifier `yaml:"classifier"`
+	// Tiers are model, alias or anthropic route names, cheapest first.
+	// tiers[0] serves a turn where no question fires.
+	Tiers []string `yaml:"tiers"`
+	// OnError serves the turn when the classifier fails. Default: last tier.
+	OnError   string                    `yaml:"on_error,omitempty"`
+	Questions map[string]RouterQuestion `yaml:"questions"`
+	// MaxStateChars caps the text sent to the classifier. Default 4000.
+	MaxStateChars int `yaml:"max_state_chars,omitempty"`
+	// CacheTTL (Go duration, default 6h) and CacheEntries (default 1024)
+	// bound the per-turn decision cache.
+	CacheTTL     string `yaml:"cache_ttl,omitempty"`
+	CacheEntries int    `yaml:"cache_entries,omitempty"`
+}
+
+// RouterClassifier is the decision-model endpoint.
+type RouterClassifier struct {
+	// Endpoint defaults to TypeSafe's https://api.typesafe.ai/v1/systemone.
+	Endpoint string `yaml:"endpoint,omitempty"`
+	// Model pins a snapshot (e.g. jev-1.13.0): calibration drifts across versions.
+	Model     string `yaml:"model"`
+	Auth      *Auth  `yaml:"auth,omitempty"`
+	TimeoutMS int    `yaml:"timeout_ms,omitempty"`
+}
+
+// RouterQuestion is one yes/no question. When the classifier's probability of
+// "yes" reaches Threshold, the turn is served on at least EscalateTo.
+type RouterQuestion struct {
+	Instructions string  `yaml:"instructions"`
+	EscalateTo   string  `yaml:"escalate_to"`
+	Threshold    float64 `yaml:"threshold"`
+}
+
+// Router defaults.
+const (
+	DefaultRouterEndpoint      = "https://api.typesafe.ai/v1/systemone"
+	DefaultRouterTimeout       = 1500 * time.Millisecond
+	DefaultRouterMaxStateChars = 4000
+	DefaultRouterCacheTTL      = 6 * time.Hour
+	DefaultRouterCacheEntries  = 1024
+	// MaxRouterQuestions is Jev's per-request question ceiling.
+	MaxRouterQuestions = 8
+)
+
+// Timeout returns TimeoutMS as a duration, defaulting to 1.5s.
+func (c RouterClassifier) Timeout() time.Duration {
+	if c.TimeoutMS > 0 {
+		return time.Duration(c.TimeoutMS) * time.Millisecond
+	}
+	return DefaultRouterTimeout
+}
+
+// TTL returns CacheTTL, defaulting to 6h.
+func (r Router) TTL() time.Duration {
+	if d, err := time.ParseDuration(r.CacheTTL); err == nil && d > 0 {
+		return d
+	}
+	return DefaultRouterCacheTTL
+}
+
+// ErrorTier returns OnError, defaulting to the last tier.
+func (r Router) ErrorTier() string {
+	if r.OnError != "" {
+		return r.OnError
+	}
+	return r.Tiers[len(r.Tiers)-1]
 }
 
 // DiscoverEvery returns DiscoverInterval, defaulting to 10 minutes.
@@ -366,8 +441,10 @@ func (c *Config) validate() error {
 			// chained alias — resolver handles cycle detection at runtime.
 			continue
 		}
-		if _, ok := c.Models[target]; !ok {
-			return fmt.Errorf("alias %q: target %q is not a model or alias", alias, target)
+		_, isModel := c.Models[target]
+		_, isRouter := c.Routers[target]
+		if !isModel && !isRouter {
+			return fmt.Errorf("alias %q: target %q is not a model, alias or router", alias, target)
 		}
 	}
 	if err := c.validateMCPBridges(); err != nil {
@@ -385,6 +462,9 @@ func (c *Config) validate() error {
 	}
 	if m := c.Management; m != nil && (m.Key == "") == (m.KeyFile == "") {
 		return errors.New("management: set exactly one of key or key_file")
+	}
+	if err := c.validateRouters(); err != nil {
+		return err
 	}
 	if err := c.validateCodexCatalog(); err != nil {
 		return err
@@ -557,8 +637,9 @@ func (c *Config) validateCodexCatalog() error {
 		}
 		_, isModel := c.Models[m]
 		_, isAlias := c.Aliases[m]
-		if !isModel && !isAlias {
-			return fmt.Errorf("codex_catalog: %q is not a model or alias", m)
+		_, isRouter := c.Routers[m]
+		if !isModel && !isAlias && !isRouter {
+			return fmt.Errorf("codex_catalog: %q is not a model, alias or router", m)
 		}
 		if seen[m] {
 			return fmt.Errorf("codex_catalog: %q listed twice", m)
@@ -566,6 +647,96 @@ func (c *Config) validateCodexCatalog() error {
 		seen[m] = true
 	}
 	return nil
+}
+
+func (c *Config) validateRouters() error {
+	for name, r := range c.Routers {
+		if name == "" {
+			return errors.New("routers: name is empty")
+		}
+		if _, ok := c.Models[name]; ok {
+			return fmt.Errorf("router %q: name clashes with a model", name)
+		}
+		if _, ok := c.Aliases[name]; ok {
+			return fmt.Errorf("router %q: name clashes with an alias", name)
+		}
+		if c.Anthropic != nil {
+			if _, ok := c.Anthropic.Routes[name]; ok {
+				return fmt.Errorf("router %q: name clashes with an anthropic route", name)
+			}
+		}
+		if r.Classifier.Model == "" {
+			return fmt.Errorf("router %q: classifier.model is required", name)
+		}
+		if r.Classifier.TimeoutMS < 0 {
+			return fmt.Errorf("router %q: classifier.timeout_ms must be >= 0", name)
+		}
+		if r.Classifier.Auth != nil {
+			if err := validateAuth("router "+name, r.Classifier.Auth); err != nil {
+				return err
+			}
+			if r.Classifier.Auth.Type != "bearer" {
+				return fmt.Errorf("router %q: classifier auth must be bearer", name)
+			}
+		}
+		if len(r.Tiers) == 0 {
+			return fmt.Errorf("router %q: tiers is empty", name)
+		}
+		tier := make(map[string]bool, len(r.Tiers))
+		for _, t := range r.Tiers {
+			if tier[t] {
+				return fmt.Errorf("router %q: tier %q listed twice", name, t)
+			}
+			tier[t] = true
+			if !c.routable(t) {
+				return fmt.Errorf("router %q: tier %q is not a model, alias or anthropic route", name, t)
+			}
+		}
+		if r.OnError != "" && !tier[r.OnError] {
+			return fmt.Errorf("router %q: on_error %q is not one of its tiers", name, r.OnError)
+		}
+		if len(r.Questions) == 0 || len(r.Questions) > MaxRouterQuestions {
+			return fmt.Errorf("router %q: needs 1 to %d questions", name, MaxRouterQuestions)
+		}
+		for qn, q := range r.Questions {
+			if strings.TrimSpace(q.Instructions) == "" {
+				return fmt.Errorf("router %q: question %q: instructions is required", name, qn)
+			}
+			if !tier[q.EscalateTo] {
+				return fmt.Errorf("router %q: question %q: escalate_to %q is not one of its tiers", name, qn, q.EscalateTo)
+			}
+			if q.Threshold <= 0 || q.Threshold > 1 {
+				return fmt.Errorf("router %q: question %q: threshold must be in (0,1]", name, qn)
+			}
+		}
+		if r.MaxStateChars < 0 || r.CacheEntries < 0 {
+			return fmt.Errorf("router %q: max_state_chars and cache_entries must be >= 0", name)
+		}
+		if r.CacheTTL != "" {
+			if _, err := time.ParseDuration(r.CacheTTL); err != nil {
+				return fmt.Errorf("router %q: cache_ttl: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// routable reports whether name is a model, an alias to one, or an anthropic
+// route — anything a router may hand a request to.
+func (c *Config) routable(name string) bool {
+	if _, ok := c.Models[name]; ok {
+		return true
+	}
+	if target, ok := c.Aliases[name]; ok {
+		_, isRouter := c.Routers[target]
+		return !isRouter
+	}
+	if c.Anthropic != nil {
+		if _, ok := c.Anthropic.Routes[name]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Config) anyDiscover() bool {

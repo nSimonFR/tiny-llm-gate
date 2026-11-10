@@ -54,7 +54,7 @@ func (s *Server) handleCodexCatalog(w http.ResponseWriter, r *http.Request) {
 	ids := s.catalogIDs()
 	out := make([]map[string]json.RawMessage, 0, len(ids))
 	for i, id := range ids {
-		res, err := s.resolver.Resolve(id)
+		res, err := s.listingResolve(id)
 		if err != nil {
 			continue
 		}
@@ -166,7 +166,7 @@ func (s *Server) catalogIDs() []string {
 	var out []string
 	seen := map[string]bool{}
 	add := func(id string) {
-		res, err := s.resolver.Resolve(id)
+		res, err := s.listingResolve(id)
 		if err != nil {
 			return
 		}

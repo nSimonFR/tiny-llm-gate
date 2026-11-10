@@ -14,6 +14,7 @@ import (
 
 	"github.com/nSimonFR/tiny-llm-gate/internal/gemini"
 	"github.com/nSimonFR/tiny-llm-gate/internal/resolve"
+	"github.com/nSimonFR/tiny-llm-gate/internal/router"
 )
 
 // handleGenerateContent handles POST /v1beta/models/{model}:generateContent
@@ -51,7 +52,11 @@ func (s *Server) serveGeminiChat(w http.ResponseWriter, r *http.Request, stream 
 		return
 	}
 
-	res, err := s.resolver.Resolve(clientModel)
+	model, r, ok := s.applyRouter(w, r, "gemini", clientModel, func() (router.Turn, error) { return router.FromGemini(body) })
+	if !ok {
+		return
+	}
+	res, err := s.resolver.Resolve(model)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
@@ -107,7 +112,7 @@ func (s *Server) serveGeminiChat(w http.ResponseWriter, r *http.Request, stream 
 		} else {
 			s.writeGeminiNonStream(w, resp)
 		}
-		s.logger.Info("served",
+		s.logger.Info("served", append([]any{
 			"request_id", reqID,
 			"frontend", "gemini",
 			"client", clientName(r),
@@ -117,7 +122,7 @@ func (s *Server) serveGeminiChat(w http.ResponseWriter, r *http.Request, stream 
 			"stream", stream,
 			"fallback_index", i,
 			"latency_ms", time.Since(started).Milliseconds(),
-		)
+		}, routeAttrs(r)...)...)
 		return
 	}
 	writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("all upstreams failed: %v", lastErr))

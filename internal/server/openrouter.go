@@ -334,11 +334,12 @@ func catalogEntry(id string, res *resolve.Resolved) orModel {
 func (s *Server) catalog(r *http.Request) []orModel {
 	ck := clientOf(r.Context())
 	ids := append(s.resolver.ListModels(), s.resolver.ListSlugs()...)
+	ids = append(ids, s.resolver.ListRouters()...)
 	sort.Strings(ids)
 	want := r.URL.Query().Get("supported_parameters")
 	out := make([]orModel, 0, len(ids))
 	for _, id := range ids {
-		res, err := s.resolver.Resolve(id)
+		res, err := s.listingResolve(id)
 		if err != nil || !ck.allows(id, res.ModelName, res.Slug) {
 			continue
 		}
@@ -378,7 +379,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // handleModel serves GET /v1/models/{id...} (ids may contain '/').
 func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	res, err := s.resolver.Resolve(id)
+	res, err := s.listingResolve(id)
 	if err != nil || !clientOf(r.Context()).allows(id, res.ModelName, res.Slug) {
 		writeJSONError(w, http.StatusNotFound, "model not found: "+id)
 		return

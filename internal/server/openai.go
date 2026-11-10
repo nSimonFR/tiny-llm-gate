@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nSimonFR/tiny-llm-gate/internal/resolve"
+	"github.com/nSimonFR/tiny-llm-gate/internal/router"
 )
 
 // Request body caps. 8 MiB is generous for batch embeddings yet keeps one
@@ -75,7 +76,16 @@ func (s *Server) proxyOpenAI(w http.ResponseWriter, r *http.Request, upstreamPat
 		return
 	}
 
-	res, err := s.resolver.Resolve(peek.Model)
+	model := peek.Model
+	if upstreamPath == chatPath {
+		var ok bool
+		model, r, ok = s.applyRouter(w, r, "openai", peek.Model, func() (router.Turn, error) { return router.FromChat(body) })
+		if !ok {
+			return
+		}
+	}
+
+	res, err := s.resolver.Resolve(model)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		s.logger.Info("unknown model",

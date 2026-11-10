@@ -120,6 +120,32 @@ func (r *Resolver) Resolve(name string) (*Resolved, error) {
 	}, nil
 }
 
+// Router follows name's alias chain and returns the router it ends on, if any.
+func (r *Resolver) Router(name string) (string, bool) {
+	current := name
+	for range len(r.cfg.Aliases) + 1 {
+		if _, ok := r.cfg.Routers[current]; ok {
+			return current, true
+		}
+		target, ok := r.cfg.Aliases[current]
+		if !ok {
+			return "", false
+		}
+		current = target
+	}
+	return "", false
+}
+
+// ListRouters returns router names, sorted.
+func (r *Resolver) ListRouters() []string {
+	out := make([]string, 0, len(r.cfg.Routers))
+	for name := range r.cfg.Routers {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // ListModels returns every model name addressable by a client (aliases and
 // canonical names). Used for /v1/models responses.
 func (r *Resolver) ListModels() []string {
