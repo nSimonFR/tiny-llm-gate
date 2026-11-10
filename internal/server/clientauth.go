@@ -165,8 +165,8 @@ func appName(r *http.Request) string {
 // for Anthropic passthrough ids) model, writing a 403 when denied.
 func (s *Server) modelAllowed(w http.ResponseWriter, r *http.Request, clientModel string, res *resolve.Resolved) bool {
 	ck := clientOf(r.Context())
-	if ck == nil {
-		return true
+	if ck == nil || routeOf(r.Context()) != nil {
+		return true // a routed target was authorized via its router name
 	}
 	names := []string{clientModel}
 	if res != nil {

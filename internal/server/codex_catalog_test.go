@@ -139,7 +139,7 @@ models:
 	for name, tc := range map[string]struct{ extra, want string }{
 		"ok":           {"codex_catalog: {provider: codex, models: [a]}", ""},
 		"non-codex":    {"codex_catalog: {provider: o, models: [a]}", "must be a codex provider"},
-		"unknown":      {"codex_catalog: {provider: codex, models: [zz]}", "not a model or alias"},
+		"unknown":      {"codex_catalog: {provider: codex, models: [zz]}", "not a model, alias or router"},
 		"empty models": {"codex_catalog: {provider: codex}", "models is empty"},
 		"patterns":     {"codex_catalog: {provider: codex, models: [\"gpt-*\", \"@o\", \"!*x*\"]}", ""},
 		"bad provider": {"codex_catalog: {provider: codex, models: [\"@nope\"]}", "unknown provider"},

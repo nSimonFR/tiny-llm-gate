@@ -13,6 +13,7 @@ import (
 	"github.com/nSimonFR/tiny-llm-gate/internal/oaichat"
 	"github.com/nSimonFR/tiny-llm-gate/internal/resolve"
 	"github.com/nSimonFR/tiny-llm-gate/internal/responses"
+	"github.com/nSimonFR/tiny-llm-gate/internal/router"
 )
 
 // errBuild marks a request the frontend could not translate: identical on
@@ -129,7 +130,11 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "missing 'model' field")
 		return
 	}
-	res, err := s.resolver.Resolve(peek.Model)
+	model, r, ok := s.applyRouter(w, r, "responses", peek.Model, func() (router.Turn, error) { return router.FromResponses(body) })
+	if !ok {
+		return
+	}
+	res, err := s.resolver.Resolve(model)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err.Error())
 		return
@@ -244,7 +249,7 @@ func (s *Server) serveMessagesTranslated(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *Server) logServed(r *http.Request, frontend, clientModel string, hop *resolve.Resolved, stream bool, idx int, started time.Time) {
-	s.logger.Info("served",
+	s.logger.Info("served", append([]any{
 		"request_id", requestID(r.Context()),
 		"frontend", frontend,
 		"client", clientName(r),
@@ -255,5 +260,5 @@ func (s *Server) logServed(r *http.Request, frontend, clientModel string, hop *r
 		"stream", stream,
 		"fallback_index", idx,
 		"latency_ms", time.Since(started).Milliseconds(),
-	)
+	}, routeAttrs(r)...)...)
 }

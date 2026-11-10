@@ -17,6 +17,7 @@ import (
 	"github.com/nSimonFR/tiny-llm-gate/internal/auth"
 	"github.com/nSimonFR/tiny-llm-gate/internal/messages"
 	"github.com/nSimonFR/tiny-llm-gate/internal/resolve"
+	"github.com/nSimonFR/tiny-llm-gate/internal/router"
 )
 
 // defaultAnthropicCooldown is used when a 429 response carries no usable
@@ -264,10 +265,14 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	// Precedence: an explicit route, then a gate model (translated unless it
 	// is an anthropic-type model), then the raw Anthropic passthrough.
-	routeName, route, routed := s.matchAnthropicRoute(peek.Model)
+	model, r, ok := s.applyRouter(w, r, "anthropic", peek.Model, func() (router.Turn, error) { return router.FromMessages(body) })
+	if !ok {
+		return
+	}
+	routeName, route, routed := s.matchAnthropicRoute(model)
 	var res *resolve.Resolved
 	if !routed {
-		if r2, err := s.resolver.Resolve(peek.Model); err == nil {
+		if r2, err := s.resolver.Resolve(model); err == nil {
 			res = r2
 		}
 	}
@@ -302,9 +307,18 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	if r.URL.RawQuery != "" {
 		upstream += "?" + r.URL.RawQuery
 	}
+	// The id to send when the body still carries the client's: a route's
+	// rename, or a router's target on a route or the raw passthrough.
 	outBody := body
-	if routed && route.model != "" && route.model != peek.Model {
-		patched, err := rewriteModelField(body, route.model)
+	want := ""
+	switch {
+	case routed && route.model != "":
+		want = route.model
+	case routed || res == nil:
+		want = model
+	}
+	if want != "" && want != peek.Model {
+		patched, err := rewriteModelField(body, want)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, "could not rewrite anthropic model")
 			return
@@ -330,7 +344,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		} else {
 			_, _ = io.Copy(w, resp.Body)
 		}
-		s.logger.Info("served", "request_id", reqID, "frontend", "anthropic", "client", clientName(r), "model", peek.Model, "account", "route:"+routeName, "stream", peek.Stream, "status", resp.StatusCode, "latency_ms", time.Since(started).Milliseconds())
+		s.logger.Info("served", append([]any{"request_id", reqID, "frontend", "anthropic", "client", clientName(r), "model", peek.Model, "account", "route:" + routeName, "stream", peek.Stream, "status", resp.StatusCode, "latency_ms", time.Since(started).Milliseconds()}, routeAttrs(r)...)...)
 		return
 	}
 
@@ -342,7 +356,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		copyHeaders(h, r.Header)
 		h.Set("Accept-Encoding", "identity")
 	}
-	resp, accountName, err := s.doAnthropicRequest(r.Context(), http.MethodPost, upstream, body, setHeaders, reqID)
+	resp, accountName, err := s.doAnthropicRequest(r.Context(), http.MethodPost, upstream, outBody, setHeaders, reqID)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return // client disconnected; no response to write.
@@ -364,7 +378,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		_, _ = io.Copy(w, resp.Body)
 	}
 
-	s.logger.Info("served",
+	s.logger.Info("served", append([]any{
 		"request_id", reqID,
 		"frontend", "anthropic",
 		"client", clientName(r),
@@ -373,7 +387,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		"stream", peek.Stream,
 		"status", resp.StatusCode,
 		"latency_ms", time.Since(started).Milliseconds(),
-	)
+	}, routeAttrs(r)...)...)
 }
 
 func (s *Server) doAnthropicRouteRequest(

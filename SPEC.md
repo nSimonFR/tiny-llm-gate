@@ -256,6 +256,55 @@ or that model's slug. Gemini-side and Anthropic-passthrough ids (e.g.
 Validation: `name` required and unique; exactly one of `key`/`key_file`;
 `rpm >= 0`; two keys with the same secret are rejected at startup.
 
+### 3.8 `routers`
+
+Optional. A router is a virtual model: once per user turn it asks a decision
+model (TypeSafe Jev) yes/no questions about the latest user message and
+serves the turn on one of its tiers.
+
+```yaml
+routers:
+  <name>:                          # client-facing model id
+    classifier:
+      endpoint: <url>              # default https://api.typesafe.ai/v1/systemone
+      model: <string>              # required; pin a snapshot (jev-1.13.0)
+      auth: { type: bearer, token_file: <path> }   # optional, re-read per call
+      timeout_ms: <int>            # default 1500
+    tiers: [<target>, …]           # cheapest first; tiers[0] = nothing fired
+    on_error: <target>             # optional; default the last tier
+    questions:                     # 1..8
+      <name>:
+        instructions: <string>     # a narrow yes/no question
+        escalate_to: <target>      # one of tiers
+        threshold: <float>         # (0,1]: P(yes) at which it fires
+    max_state_chars: <int>         # default 4000
+    cache_ttl: <duration>          # default 6h
+    cache_entries: <int>           # default 1024
+```
+
+The turn is served on the highest `escalate_to` among fired questions, else
+`tiers[0]`. A classifier error, timeout or missing answer serves `on_error`;
+a classifier credential that fails to load at startup disables only that
+router's classifier.
+
+One decision per user turn: the decision is cached under a hash of the
+router name, system prompt and every message up to the last user message.
+Tool calls and tool results are not messages for this purpose, and a user
+message carrying a tool result (Anthropic `tool_result`, Gemini
+`functionResponse`) does not start a turn, so a whole tool loop costs one
+classifier call. Concurrent requests for the same turn share one call. A
+failure is cached for at most 5 minutes.
+
+The classifier sees only the latest user message and the tail of the
+previous assistant reply (a quarter of `max_state_chars`), quoted as
+untrusted evidence. It never sees tool traffic.
+
+Validation: the name must not be a model, alias or anthropic route; `tiers`
+non-empty, no duplicates, each a model, an alias to one, or an
+`anthropic.routes` key; `on_error` and every `escalate_to` one of the tiers;
+`threshold` in (0,1]; `classifier.model` required; classifier auth, if set,
+is `bearer`. Aliases may target a router.
+
 ---
 
 ## 4. HTTP surface
@@ -287,13 +336,18 @@ Every row (and `POST /v1/messages`, §4.2) is also served under `/api/v1/…`.
    - *Chat only:* fold the OpenRouter dialect (§4.1.2). The body is
      untouched unless an OpenRouter-only field is present.
 2. **Inspect** the `model` and `stream` fields. Missing/invalid → `400`.
-3. **Resolve** the model through `aliases → models → providers`. Unknown →
+3. *Chat only:* a router id (§3.8) is replaced by the target it picks for
+   this turn, and the response carries `x-litellm-model-id: <target>`. The
+   key must allow the router id, else `403`; the target then needs no
+   allowlist entry. The Responses, Gemini and Anthropic chat routes do the
+   same before their own resolution.
+4. **Resolve** the model through `aliases → models → providers`. Unknown →
    `404`.
    The caller's key must allow the model (§3.7), else `403`.
-4. **Build chain** = `[resolved_model, <OpenRouter models[]…>, fallback[0],
+5. **Build chain** = `[resolved_model, <OpenRouter models[]…>, fallback[0],
    fallback[1], ...]`, deduplicated; `models[]` entries the key may not use
    are skipped.
-5. For each hop in the chain:
+6. For each hop in the chain:
    - Rewrite the body's top-level `model` field to the hop's
      `upstream_model`. **Field order in the body MUST be preserved** — only
      the `model` value changes. (See invariant §11.5 — observability sniffers
@@ -312,9 +366,9 @@ Every row (and `POST /v1/messages`, §4.2) is also served under `/api/v1/…`.
      5xx; retrying makes the same call fail the same way.)
    - On success (or non-retryable failure), copy hop-by-hop-filtered headers
      to the client, write status, stream/copy body.
-6. **Streaming**: when `stream: true` and upstream returned `200`, body is
+7. **Streaming**: when `stream: true` and upstream returned `200`, body is
    piped to the client with explicit flushes (see §4.6).
-7. **All hops failed**: respond `502` with
+8. **All hops failed**: respond `502` with
    `{"error":{"message":"all upstreams failed: ...","type":"tiny_llm_gate_error"}}`.
 
 Headers stripped on the upstream-response path: `Connection`, `Keep-Alive`,
@@ -489,7 +543,8 @@ Request flow:
 
 #### 4.2.1 Dispatch and translation
 
-The handler picks one path per request, in order:
+The handler picks one path per request, in order, after a router (§3.8)
+has replaced the client's id with its target:
 
 1. An `anthropic.routes` match → that route (pass-through to its upstream).
 2. A gate model (§5.2) on a **non-`anthropic`** provider → translated:
@@ -748,7 +803,8 @@ Given a client-supplied model name, resolution produces:
 ### 5.4 Model list
 
 Model listing MUST return every key from both `models` and `aliases`, plus
-every model's `vendor/name` slug (§5.2). Used by `/v1/models` and `/v1beta/models`. See
+every model's `vendor/name` slug (§5.2) and every router (§3.8, described by
+its last tier's metadata, `owned_by: router`). Used by `/v1/models` and `/v1beta/models`. See
 invariant §11.8 — AFFiNE's `CopilotProviderFactory` keys provider routing on
 this list and breaks if aliases are dropped.
 
@@ -866,6 +922,11 @@ JSON to stderr, level Info. Each served request emits a `served` line with:
   `resolved_model`, `provider`, `stream`, `fallback_index`, `latency_ms`.
 
 Errors include `request_id` and an `err` field.
+
+A request served through a router (§3.8) adds `router`, `routed_to`,
+`route_cache_hit`, `classifier_ms`, `route_signals` (question → P(yes), when
+the classifier answered) and `route_err` (when it did not). A classifier
+failure also logs one `router classifier failed; using on_error` warning.
 
 MCP bridge logs include `mcp_bridge=<name>` and, within sessions,
 `session=<id>`.
@@ -1055,6 +1116,9 @@ broken.
   `internal/server/codex.go`.
 - **Routing & resolver**: `internal/resolve` — alias-chain walk with cycle
   detection.
+- **Routers**: `internal/router` (turn extraction per wire format, Jev
+  client, decision cache); `internal/server/router.go` hooks it into every
+  chat frontend.
 - **HTTP server wiring**: `internal/server` — mux, HTTP clients, MCP bridge
   construction, request-ID middleware.
 - **OpenAI frontend**: `internal/server/openai.go` — includes the

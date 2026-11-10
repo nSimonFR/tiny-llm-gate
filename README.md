@@ -106,6 +106,13 @@ management:                 # optional; serves /v0/management for usage hubs
 
 discover_interval: 10m      # optional; how often discovering providers are re-polled
 
+routers:                    # optional; virtual models picked per user turn by TypeSafe Jev
+  smart:
+    classifier: { model: jev-1.13.0, auth: { type: bearer, token_file: /run/secrets/typesafe } }
+    tiers: [gpt-6-luna, gpt-6.1-sol]   # cheapest first
+    questions:              # narrow yes/no; P(yes) >= threshold escalates
+      deep_reasoning: { instructions: "Does it ask for debugging, analysis or a plan?", escalate_to: gpt-6.1-sol, threshold: 0.4 }
+
 codex_catalog:              # optional; serves GET /codex/models for Codex CLI
   provider: codex           # a type: codex provider; its upstream catalog is cloned
   models: [gpt-6-luna, "gpt-6*", "@ollama", "!*embed*"]  # ids, globs, @provider, !exclude
@@ -139,6 +146,8 @@ See [`testdata/example-config.yaml`](testdata/example-config.yaml) for a fuller 
 Every `/v1/...` route above is also served at `/api/v1/...` (OpenRouter's base path).
 
 The `/v0/management` routes are the subset of CLIProxyAPI's management API that usage dashboards read, so the gate can be added as a CLIProxyAPI hub (e.g. T3 Code: **Settings → Providers → Usage providers → Add hub**, URL `http://<host>:4001`, the management key). They take the management key, not a client key. The tokens never leave the gate: `api-call` only reaches the Anthropic and ChatGPT hosts and fills the account's credentials itself. Account emails let the hub match an account signed in elsewhere: Codex reads it from the token, Claude asks Anthropic's OAuth profile once (or set `email:` on the `anthropic.accounts` entry).
+
+A **router** (`routers:`) is a model id clients use like any other. Once per user turn — tool calls and tool results don't start one — it asks [TypeSafe's Jev](https://docs.typesafe.ai) a few yes/no questions about the latest user message and serves the turn on the cheapest tier no fired question escalates past, on all four chat frontends. The pick is in the `x-litellm-model-id` response header and the `routed_to` log field; a classifier failure serves `on_error` (default: the last tier). See SPEC §3.8.
 
 Gemini requests are transparently translated to OpenAI format before being forwarded to the upstream — you can point an AFFiNE Gemini provider at this gateway and route to an Ollama backend.
 

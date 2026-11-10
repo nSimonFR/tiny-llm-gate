@@ -93,3 +93,19 @@ aliases:
   "gemini-2.0-flash-001":   "gemma4:e4b"
   "gemini-embedding-001":   "qwen3-embedding:8b"
   "text-embedding-004":     "qwen3-embedding:8b"
+
+# Virtual model: TypeSafe Jev picks a tier once per user turn (SPEC §3.8).
+routers:
+  smart:
+    classifier:
+      model: jev-1.13.0
+      auth: { type: bearer, token_file: /run/agenix/typesafe-api-key }
+    tiers: ["gemma4:e4b", "gpt-5.4"]
+    on_error: "gpt-5.4"
+    questions:
+      multi_step_tools:
+        instructions: >-
+          Will answering need several actions or tool calls (searching,
+          reading files, running commands) rather than one direct reply?
+        escalate_to: "gpt-5.4"
+        threshold: 0.5
