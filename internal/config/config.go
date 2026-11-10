@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -30,6 +32,17 @@ type Config struct {
 	// so a Codex model provider can point model_catalog_url at the gate and
 	// list exactly these models. Unset keeps the route unregistered.
 	CodexCatalog *CodexCatalog `yaml:"codex_catalog,omitempty"`
+	// DiscoverInterval is how often discovering providers are re-polled
+	// (Go duration). Default 10m.
+	DiscoverInterval string `yaml:"discover_interval,omitempty"`
+}
+
+// DiscoverEvery returns DiscoverInterval, defaulting to 10 minutes.
+func (c *Config) DiscoverEvery() time.Duration {
+	if d, err := time.ParseDuration(c.DiscoverInterval); err == nil && d > 0 {
+		return d
+	}
+	return 10 * time.Minute
 }
 
 // CodexCatalog picks the models Codex CLI may list. Entries are cloned from
@@ -37,7 +50,9 @@ type Config struct {
 // each keeps its instructions and tool settings, then renamed to the gate id.
 type CodexCatalog struct {
 	Provider string `yaml:"provider"`
-	// Models are gate model or alias names, in picker order.
+	// Models are picker entries, in order: a model or alias name, a glob with
+	// `*` (`gpt-6*`), `@provider` for all of its models, or `!glob` to drop
+	// earlier matches. Globs cover declared and discovered models.
 	Models []string `yaml:"models"`
 	// Template is the upstream slug cloned for a model the upstream catalog
 	// does not list (non-codex providers). Empty = the first upstream entry.
@@ -193,6 +208,13 @@ type Provider struct {
 	// Auth describes how to authenticate upstream requests. Optional: when
 	// absent and APIKey is empty, requests are sent unauthenticated.
 	Auth *Auth `yaml:"auth,omitempty"`
+	// Discover polls the upstream's model list and routes every id it finds,
+	// named DiscoverPrefix + id. Declared models and aliases win on a clash.
+	Discover       bool   `yaml:"discover,omitempty"`
+	DiscoverPrefix string `yaml:"discover_prefix,omitempty"`
+	// DiscoverOnly keeps upstream ids matching one of these `*` globs. Empty
+	// keeps all. Matters for a paid market listing hundreds of models.
+	DiscoverOnly []string `yaml:"discover_only,omitempty"`
 }
 
 // Auth is the upstream authentication strategy.
@@ -305,6 +327,9 @@ func (c *Config) validate() error {
 				return fmt.Errorf("provider %q: type anthropic uses the shared anthropic pool; do not set auth/api_key", name)
 			}
 		}
+		if p.Discover && p.Type == "anthropic" {
+			return fmt.Errorf("provider %q: discover is not supported for type anthropic", name)
+		}
 		if p.APIKey != "" && p.Auth != nil {
 			return fmt.Errorf("provider %q: use either api_key or auth, not both", name)
 		}
@@ -314,7 +339,7 @@ func (c *Config) validate() error {
 			}
 		}
 	}
-	if len(c.Models) == 0 {
+	if len(c.Models) == 0 && !c.anyDiscover() {
 		return errors.New("no models defined")
 	}
 	for name, m := range c.Models {
@@ -351,6 +376,11 @@ func (c *Config) validate() error {
 	if c.Anthropic != nil {
 		if err := c.validateAnthropic(); err != nil {
 			return err
+		}
+	}
+	if c.DiscoverInterval != "" {
+		if _, err := time.ParseDuration(c.DiscoverInterval); err != nil {
+			return fmt.Errorf("discover_interval: %w", err)
 		}
 	}
 	if m := c.Management; m != nil && (m.Key == "") == (m.KeyFile == "") {
@@ -516,6 +546,15 @@ func (c *Config) validateCodexCatalog() error {
 	}
 	seen := map[string]bool{}
 	for _, m := range cc.Models {
+		if strings.ContainsRune(m, '*') || strings.HasPrefix(m, "!") {
+			continue
+		}
+		if p, ok := strings.CutPrefix(m, "@"); ok {
+			if _, known := c.Providers[p]; !known {
+				return fmt.Errorf("codex_catalog: unknown provider %q", m)
+			}
+			continue
+		}
 		_, isModel := c.Models[m]
 		_, isAlias := c.Aliases[m]
 		if !isModel && !isAlias {
@@ -527,4 +566,13 @@ func (c *Config) validateCodexCatalog() error {
 		seen[m] = true
 	}
 	return nil
+}
+
+func (c *Config) anyDiscover() bool {
+	for _, p := range c.Providers {
+		if p.Discover {
+			return true
+		}
+	}
+	return false
 }

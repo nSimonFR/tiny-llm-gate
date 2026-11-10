@@ -6,6 +6,8 @@ package resolve
 import (
 	"fmt"
 	"sort"
+	"sync"
+	"sync/atomic"
 
 	"github.com/nSimonFR/tiny-llm-gate/internal/config"
 )
@@ -16,11 +18,18 @@ type Resolver struct {
 	// slugs maps `vendor/model` (and `provider/model`) ids to canonical model
 	// names. Explicit model/alias names shadow them.
 	slugs map[string]string
+
+	// discovered holds models found by polling upstreams, keyed by name.
+	// Declared models and aliases shadow it.
+	discovered atomic.Pointer[map[string]config.Model]
+	mu         sync.Mutex
+	byProvider map[string]map[string]config.Model
 }
 
 // New creates a Resolver over an already-validated config.
 func New(cfg *config.Config) *Resolver {
-	r := &Resolver{cfg: cfg, slugs: map[string]string{}}
+	r := &Resolver{cfg: cfg, slugs: map[string]string{}, byProvider: map[string]map[string]config.Model{}}
+	r.discovered.Store(&map[string]config.Model{})
 	for name, m := range cfg.Models {
 		for _, ns := range []string{m.Vendor(), m.Provider} {
 			id := ns + "/" + name
@@ -87,6 +96,9 @@ func (r *Resolver) Resolve(name string) (*Resolved, error) {
 	}
 	m, ok := r.cfg.Models[current]
 	if !ok {
+		m, ok = (*r.discovered.Load())[current]
+	}
+	if !ok {
 		return nil, fmt.Errorf("unknown model %q", name)
 	}
 	p, ok := r.cfg.Providers[m.Provider]
@@ -118,7 +130,55 @@ func (r *Resolver) ListModels() []string {
 	for name := range r.cfg.Aliases {
 		out = append(out, name)
 	}
+	for name := range *r.discovered.Load() {
+		if !r.declared(name) {
+			out = append(out, name)
+		}
+	}
 	return out
+}
+
+// Concrete returns declared model names (sorted) followed by discovered ones
+// (sorted), without aliases.
+func (r *Resolver) Concrete() []string {
+	static := make([]string, 0, len(r.cfg.Models))
+	for name := range r.cfg.Models {
+		static = append(static, name)
+	}
+	sort.Strings(static)
+	var found []string
+	for name := range *r.discovered.Load() {
+		if !r.declared(name) {
+			found = append(found, name)
+		}
+	}
+	sort.Strings(found)
+	return append(static, found...)
+}
+
+// SetDiscovered replaces one provider's discovered upstream ids.
+func (r *Resolver) SetDiscovered(provider string, upstreamIDs []string) {
+	p := r.cfg.Providers[provider]
+	set := make(map[string]config.Model, len(upstreamIDs))
+	for _, id := range upstreamIDs {
+		set[p.DiscoverPrefix+id] = config.Model{Provider: provider, UpstreamModel: id}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byProvider[provider] = set
+	all := map[string]config.Model{}
+	for _, models := range r.byProvider {
+		for name, m := range models {
+			all[name] = m
+		}
+	}
+	r.discovered.Store(&all)
+}
+
+func (r *Resolver) declared(name string) bool {
+	_, isModel := r.cfg.Models[name]
+	_, isAlias := r.cfg.Aliases[name]
+	return isModel || isAlias
 }
 
 // ListSlugs returns the `vendor/name` id of every concrete model, sorted.
