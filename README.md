@@ -75,6 +75,9 @@ providers:                  # upstream LLM endpoints
     type: openai            # only "openai" today
     base_url: <url>         # e.g. http://host:11434/v1
     api_key: <string>       # Bearer token; omit for unauthenticated upstreams
+    discover: true          # optional: route every id its /models lists
+    discover_prefix: ""     # optional: name discovered ids <prefix><id>
+    discover_only: [gpt-*]  # optional: keep only ids matching these globs
 
 models:                     # canonical model names
   <name>:
@@ -101,9 +104,11 @@ client_keys:                # optional; when set, every LLM route needs a key
 management:                 # optional; serves /v0/management for usage hubs
   key_file: /run/secrets/tlg-management   # or key: <string>
 
+discover_interval: 10m      # optional; how often discovering providers are re-polled
+
 codex_catalog:              # optional; serves GET /codex/models for Codex CLI
   provider: codex           # a type: codex provider; its upstream catalog is cloned
-  models: [gpt-6-luna, asale-gpt-6-luna, gemma4:26b]  # gate ids, picker order
+  models: [gpt-6-luna, "gpt-6*", "@ollama", "!*embed*"]  # ids, globs, @provider, !exclude
   template: gpt-6-luna      # optional: upstream entry cloned for ids it lacks
 
 ```

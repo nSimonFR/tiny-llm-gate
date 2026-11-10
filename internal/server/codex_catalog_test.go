@@ -141,10 +141,35 @@ models:
 		"non-codex":    {"codex_catalog: {provider: o, models: [a]}", "must be a codex provider"},
 		"unknown":      {"codex_catalog: {provider: codex, models: [zz]}", "not a model or alias"},
 		"empty models": {"codex_catalog: {provider: codex}", "models is empty"},
+		"patterns":     {"codex_catalog: {provider: codex, models: [\"gpt-*\", \"@o\", \"!*x*\"]}", ""},
+		"bad provider": {"codex_catalog: {provider: codex, models: [\"@nope\"]}", "unknown provider"},
+		"bad interval": {"discover_interval: soon", "discover_interval"},
 	} {
 		_, err := config.Parse([]byte(base + tc.extra))
 		if (err == nil) != (tc.want == "") || (err != nil && !strings.Contains(err.Error(), tc.want)) {
 			t.Errorf("%s: err = %v, want %q", name, err, tc.want)
 		}
+	}
+}
+
+func TestDiscoverRejectedOnAnthropic(t *testing.T) {
+	_, err := config.Parse([]byte(`
+providers:
+  a: {type: anthropic, base_url: http://z, discover: true}
+anthropic: {upstream: http://z, auth: {type: bearer, token: t}}
+models:
+  m: {provider: a, upstream_model: m}
+`))
+	if err == nil || !strings.Contains(err.Error(), "discover is not supported") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDiscoverAllowsNoDeclaredModels(t *testing.T) {
+	if _, err := config.Parse([]byte(`
+providers:
+  o: {type: openai, base_url: http://y, discover: true}
+`)); err != nil {
+		t.Fatal(err)
 	}
 }

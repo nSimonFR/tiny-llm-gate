@@ -55,6 +55,7 @@ func main() {
 	// Graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	go s.RunDiscovery(ctx)
 
 	go func() {
 		<-ctx.Done()

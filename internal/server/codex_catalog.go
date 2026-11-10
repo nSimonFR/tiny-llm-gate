@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -33,7 +34,7 @@ func (s *Server) handleCodexCatalog(w http.ResponseWriter, r *http.Request) {
 	if version == "" {
 		version = "1.0.0"
 	}
-	upstream, err := s.upstreamCodexCatalog(r, version)
+	upstream, err := s.upstreamCodexCatalog(r.Context(), version)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, err.Error())
 		return
@@ -50,8 +51,9 @@ func (s *Server) handleCodexCatalog(w http.ResponseWriter, r *http.Request) {
 		template = t
 	}
 
-	out := make([]map[string]json.RawMessage, 0, len(cc.Models))
-	for i, id := range cc.Models {
+	ids := s.catalogIDs()
+	out := make([]map[string]json.RawMessage, 0, len(ids))
+	for i, id := range ids {
 		res, err := s.resolver.Resolve(id)
 		if err != nil {
 			continue
@@ -90,14 +92,14 @@ func (s *Server) handleCodexCatalog(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"models": out})
 }
 
-func (s *Server) upstreamCodexCatalog(r *http.Request, version string) ([]map[string]json.RawMessage, error) {
+func (s *Server) upstreamCodexCatalog(ctx context.Context, version string) ([]map[string]json.RawMessage, error) {
 	c := &s.codexCatalog
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.models != nil && c.version == version && time.Since(c.fetched) < codexCatalogTTL {
 		return c.models, nil
 	}
-	models, err := s.fetchCodexCatalog(r, version)
+	models, err := s.fetchCodexCatalog(ctx, s.cfg.CodexCatalog.Provider, version)
 	if err != nil {
 		if c.models != nil {
 			s.logger.Warn("codex catalog fetch failed; serving cached", "err", err)
@@ -109,14 +111,13 @@ func (s *Server) upstreamCodexCatalog(r *http.Request, version string) ([]map[st
 	return models, nil
 }
 
-func (s *Server) fetchCodexCatalog(r *http.Request, version string) ([]map[string]json.RawMessage, error) {
-	name := s.cfg.CodexCatalog.Provider
+func (s *Server) fetchCodexCatalog(ctx context.Context, name, version string) ([]map[string]json.RawMessage, error) {
 	if reason, ok := s.disabled[name]; ok {
 		return nil, fmt.Errorf("codex catalog: provider %q disabled: %s", name, reason)
 	}
 	p := s.cfg.Providers[name]
 	u := strings.TrimRight(p.BaseURL, "/") + "/models?client_version=" + url.QueryEscape(version)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +126,7 @@ func (s *Server) fetchCodexCatalog(r *http.Request, version string) ([]map[strin
 	req.Header.Set("User-Agent", codexUserAgent)
 	req.Header.Set("x-codex-installation-id", codexInstallationID)
 	if authz, ok := s.auths[name]; ok {
-		if err := authz.Apply(r.Context(), req); err != nil {
+		if err := authz.Apply(ctx, req); err != nil {
 			return nil, fmt.Errorf("codex catalog auth: %w", err)
 		}
 	}
@@ -156,4 +157,72 @@ func (s *Server) fetchCodexCatalog(r *http.Request, version string) ([]map[strin
 func rawJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// catalogIDs expands codex_catalog.models into gate ids, in order. Two ids
+// routing to the same provider and upstream model are listed once.
+func (s *Server) catalogIDs() []string {
+	concrete := s.resolver.Concrete()
+	var out []string
+	seen := map[string]bool{}
+	add := func(id string) {
+		res, err := s.resolver.Resolve(id)
+		if err != nil {
+			return
+		}
+		key := res.ProviderName + "\x00" + res.UpstreamModel
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, id)
+	}
+	for _, entry := range s.cfg.CodexCatalog.Models {
+		switch {
+		case strings.HasPrefix(entry, "!"):
+			pat := entry[1:]
+			kept := out[:0]
+			for _, id := range out {
+				if !globMatch(pat, id) {
+					kept = append(kept, id)
+				}
+			}
+			out = kept
+		case strings.HasPrefix(entry, "@"):
+			for _, id := range concrete {
+				if res, err := s.resolver.Resolve(id); err == nil && res.ProviderName == entry[1:] {
+					add(id)
+				}
+			}
+		case strings.ContainsRune(entry, '*'):
+			for _, id := range concrete {
+				if globMatch(entry, id) {
+					add(id)
+				}
+			}
+		default:
+			add(entry)
+		}
+	}
+	return out
+}
+
+// globMatch matches name against pattern, where `*` is any run of characters.
+func globMatch(pattern, name string) bool {
+	parts := strings.Split(pattern, "*")
+	if !strings.HasPrefix(name, parts[0]) {
+		return false
+	}
+	name = name[len(parts[0]):]
+	for i, part := range parts[1:] {
+		if i == len(parts)-2 {
+			return strings.HasSuffix(name, part)
+		}
+		j := strings.Index(name, part)
+		if j < 0 {
+			return false
+		}
+		name = name[j+len(part):]
+	}
+	return name == ""
 }
