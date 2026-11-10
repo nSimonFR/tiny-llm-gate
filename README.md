@@ -101,6 +101,11 @@ client_keys:                # optional; when set, every LLM route needs a key
 management:                 # optional; serves /v0/management for usage hubs
   key_file: /run/secrets/tlg-management   # or key: <string>
 
+codex_catalog:              # optional; serves GET /codex/models for Codex CLI
+  provider: codex           # a type: codex provider; its upstream catalog is cloned
+  models: [gpt-6-luna, asale-gpt-6-luna, gemma4:26b]  # gate ids, picker order
+  template: gpt-6-luna      # optional: upstream entry cloned for ids it lacks
+
 ```
 
 See [`testdata/example-config.yaml`](testdata/example-config.yaml) for a fuller example.
@@ -122,6 +127,7 @@ See [`testdata/example-config.yaml`](testdata/example-config.yaml) for a fuller 
 | GET    | `/v0/management/auth-files` | Subscription accounts (`anthropic.accounts`, `oauth_chatgpt` providers), when `management:` is set |
 | POST   | `/v0/management/api-call`   | Relay a usage request to `api.anthropic.com` / `chatgpt.com` with one account's token |
 | POST   | `/v0/management/reset-quota` | Lift the gate's cooldown on an account |
+| GET    | `/codex/models`        | Codex CLI catalog of `codex_catalog.models`, for a provider's `model_catalog_url` (replaces Codex's built-in list) |
 | GET    | `/health`              | liveness |
 | GET    | `/ready`               | readiness (config loaded) |
 

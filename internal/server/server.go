@@ -56,6 +56,7 @@ type Server struct {
 	// managementKey is the SHA-256 of the /v0/management secret; nil when
 	// management is not configured.
 	managementKey *[32]byte
+	codexCatalog  codexCatalogCache
 }
 
 // New builds a Server. The *http.Client has generous timeouts for streaming
@@ -271,6 +272,10 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("GET /v0/management/auth-files", s.management(s.handleAuthFiles))
 		mux.HandleFunc("POST /v0/management/api-call", s.management(s.handleAPICall))
 		mux.HandleFunc("POST /v0/management/reset-quota", s.management(s.handleResetQuota))
+	}
+
+	if s.cfg.CodexCatalog != nil {
+		mux.HandleFunc("GET /codex/models", s.guard(s.handleCodexCatalog))
 	}
 
 	// Health and readiness
