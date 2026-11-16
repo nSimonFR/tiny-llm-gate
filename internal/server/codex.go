@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/nSimonFR/tiny-llm-gate/internal/codex"
 	"github.com/nSimonFR/tiny-llm-gate/internal/resolve"
@@ -60,6 +62,20 @@ func (s *Server) codexUpstream(
 	}
 
 	tr := codex.NewTranslator(hop.ModelName)
+	reqID := requestID(r.Context())
+	tr.Reopen = func() (io.ReadCloser, error) {
+		s.logger.Warn("codex: upstream stalled, retrying", "request_id", reqID, "model", hop.ModelName)
+		up, _, err := s.codexPost(r, hop, codexBody, false)
+		if err != nil {
+			return nil, err
+		}
+		if up.StatusCode < 200 || up.StatusCode >= 300 {
+			drain(up.Body)
+			up.Body.Close()
+			return nil, fmt.Errorf("codex upstream status %d on retry", up.StatusCode)
+		}
+		return up.Body, nil
+	}
 
 	if !isStream {
 		out, cerr := tr.Collect(up.Body)
@@ -74,6 +90,9 @@ func (s *Server) codexUpstream(
 	go func() {
 		defer up.Body.Close()
 		_, serr := tr.Stream(pipeFlusher{pw}, up.Body)
+		if errors.Is(serr, codex.ErrStalled) {
+			s.logger.Warn("codex: upstream stalled after output, ending stream", "request_id", reqID, "model", hop.ModelName)
+		}
 		pw.CloseWithError(serr)
 	}()
 	return synthOpenAIResponse(true, pr), false, nil
@@ -84,8 +103,11 @@ func (s *Server) codexUpstream(
 // non-2xx response comes back unread for the caller to forward.
 func (s *Server) codexPost(r *http.Request, hop *resolve.Resolved, codexBody []byte, canRetry bool) (*http.Response, bool, error) {
 	url := strings.TrimRight(hop.Provider.BaseURL, "/") + "/responses"
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(codexBody))
+	// Per-attempt context: the stall guard cancels it to unblock a silent body.
+	ctx, cancel := context.WithCancel(r.Context())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(codexBody))
 	if err != nil {
+		cancel()
 		return nil, false, fmt.Errorf("build codex request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -99,12 +121,14 @@ func (s *Server) codexPost(r *http.Request, hop *resolve.Resolved, codexBody []b
 	// Auth (oauth_chatgpt) sets Authorization + ChatGPT-Account-Id.
 	if authz, ok := s.auths[hop.ProviderName]; ok {
 		if err := authz.Apply(r.Context(), req); err != nil {
+			cancel()
 			return nil, false, fmt.Errorf("codex auth: %w", err)
 		}
 	}
 
 	up, err := s.client.Do(req)
 	if err != nil {
+		cancel()
 		if errors.Is(err, context.Canceled) {
 			return nil, false, err // client disconnected
 		}
@@ -117,9 +141,55 @@ func (s *Server) codexPost(r *http.Request, hop *resolve.Resolved, codexBody []b
 	if shouldFallbackStatus(hop, up.StatusCode, canRetry) {
 		drain(up.Body)
 		up.Body.Close()
+		cancel()
 		return nil, true, fmt.Errorf("codex upstream status %d", up.StatusCode)
 	}
+	up.Body = guardStall(up.Body, cancel, codexFirstByteTimeout, codexIdleTimeout)
 	return up, false, nil
+}
+
+// A healthy ChatGPT stream sends response.created within a second or two;
+// 300s between bytes is Codex CLI's own stream_idle_timeout default.
+var (
+	codexFirstByteTimeout = 60 * time.Second
+	codexIdleTimeout      = 300 * time.Second
+)
+
+// stallGuard cancels an upstream attempt that sends no byte for too long, so a
+// silent stream fails with codex.ErrStalled instead of hanging until the client
+// gives up. Close also cancels the attempt.
+type stallGuard struct {
+	body    io.ReadCloser
+	cancel  context.CancelFunc
+	timer   *time.Timer
+	idle    time.Duration
+	stalled atomic.Bool
+}
+
+func guardStall(body io.ReadCloser, cancel context.CancelFunc, first, idle time.Duration) *stallGuard {
+	g := &stallGuard{body: body, cancel: cancel, idle: idle}
+	g.timer = time.AfterFunc(first, func() {
+		g.stalled.Store(true)
+		cancel()
+	})
+	return g
+}
+
+func (g *stallGuard) Read(p []byte) (int, error) {
+	n, err := g.body.Read(p)
+	if n > 0 {
+		g.timer.Reset(g.idle)
+	}
+	if err != nil && g.stalled.Load() {
+		return n, codex.ErrStalled
+	}
+	return n, err
+}
+
+func (g *stallGuard) Close() error {
+	g.timer.Stop()
+	g.cancel()
+	return g.body.Close()
 }
 
 func randomUUID() string {
