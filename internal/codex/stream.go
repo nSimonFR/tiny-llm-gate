@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -21,7 +22,19 @@ type Translator struct {
 	model   string
 	id      string
 	created int64
+
+	// Reopen, when set, starts a fresh upstream attempt after the current one
+	// fails with ErrStalled, as long as no content has reached the client.
+	Reopen func() (io.ReadCloser, error)
 }
+
+// ErrStalled marks an upstream body that went silent past its watchdog. The
+// ChatGPT backend sometimes answers 200 then sends nothing, while an identical
+// request completes in seconds (openai/codex#32987).
+var ErrStalled = errors.New("codex upstream stalled")
+
+// maxReopens bounds the fresh attempts one response may make after stalls.
+const maxReopens = 2
 
 // NewTranslator builds a Translator for the given client-facing model name.
 func NewTranslator(model string) *Translator {
@@ -47,7 +60,9 @@ type aggregate struct {
 	// argument delta/done events referencing an item id resolve correctly.
 	itemIDToCall map[string]*toolAccum
 	byCallID     map[string]*toolAccum
-	errEvent     *struct {
+	// emitted is set once a content or tool chunk has been produced.
+	emitted  bool
+	errEvent *struct {
 		Type    string
 		Code    string
 		Message string
@@ -72,55 +87,19 @@ func newAggregate() *aggregate {
 // `dst`, flushing after every write. It returns the collected usage (may be
 // nil) and any terminal error event surfaced by the backend.
 func (t *Translator) Stream(dst flusher, src io.Reader) (*openAIUsage, error) {
-	agg := newAggregate()
-
 	// Opening role chunk.
 	t.writeChunk(dst, openAIChunk{
 		ID: t.id, Object: "chat.completion.chunk", Created: t.created, Model: t.model,
 		Choices: []chunkChoice{{Index: 0, Delta: chunkDelta{Role: "assistant"}}},
 	})
 
-	sc := newSSEScanner(src)
-	for sc.next() {
-		evt, ok := sc.event()
-		if !ok {
-			continue
-		}
-		switch evt.Type {
-		case "response.output_text.delta":
-			if evt.Delta != "" {
-				t.writeChunk(dst, t.contentChunk(evt.Delta))
-			}
-		case "response.output_item.added":
-			if evt.Item != nil && evt.Item.Type == "function_call" && evt.Item.CallID != "" {
-				ta := agg.startTool(evt.Item.CallID, evt.Item.Name)
-				agg.itemIDToCall[evt.Item.ID] = ta
-				t.writeChunk(dst, t.toolStartChunk(ta))
-			}
-		case "response.function_call_arguments.delta":
-			ta := agg.resolveTool(evt.argCallID(), "")
-			if ta != nil && evt.Delta != "" {
-				ta.args.WriteString(evt.Delta)
-				t.writeChunk(dst, t.toolArgsChunk(ta, evt.Delta))
-			}
-		case "response.function_call_arguments.done":
-			// Parallel calls can arrive with no deltas, arguments only here.
-			ta := agg.resolveTool(evt.argCallID(), evt.Name)
-			if ta != nil && ta.args.Len() == 0 && evt.Args != "" {
-				ta.args.WriteString(evt.Args)
-				t.writeChunk(dst, t.toolArgsChunk(ta, evt.Args))
-			}
-		case "response.completed", "response.incomplete":
-			if evt.Response != nil && evt.Response.Usage != nil {
-				agg.usage = evt.Response.Usage
-			}
-		case "error", "response.failed":
-			if evt.Error != nil {
-				return nil, fmt.Errorf("codex upstream error (%s): %s", evt.Error.Code, evt.Error.Message)
-			}
-		}
+	emit := func(c openAIChunk) { t.writeChunk(dst, c) }
+	agg, err := t.consume(src, emit)
+	// Only the role chunk has reached the client, so a fresh attempt is invisible.
+	for n := 0; errors.Is(err, ErrStalled) && !agg.emitted && n < maxReopens && t.Reopen != nil; n++ {
+		agg, err = t.reopenAndConsume(emit)
 	}
-	if err := sc.err(); err != nil {
+	if err != nil {
 		return nil, err
 	}
 
@@ -144,40 +123,11 @@ func (t *Translator) Stream(dst flusher, src io.Reader) (*openAIUsage, error) {
 // Collect consumes the whole Codex SSE stream and returns a single OpenAI
 // chat.completion JSON object (for non-streaming clients).
 func (t *Translator) Collect(src io.Reader) ([]byte, error) {
-	agg := newAggregate()
-	sc := newSSEScanner(src)
-	for sc.next() {
-		evt, ok := sc.event()
-		if !ok {
-			continue
-		}
-		switch evt.Type {
-		case "response.output_text.delta":
-			agg.content.WriteString(evt.Delta)
-		case "response.output_item.added":
-			if evt.Item != nil && evt.Item.Type == "function_call" && evt.Item.CallID != "" {
-				ta := agg.startTool(evt.Item.CallID, evt.Item.Name)
-				agg.itemIDToCall[evt.Item.ID] = ta
-			}
-		case "response.function_call_arguments.delta":
-			if ta := agg.resolveTool(evt.argCallID(), ""); ta != nil {
-				ta.args.WriteString(evt.Delta)
-			}
-		case "response.function_call_arguments.done":
-			if ta := agg.resolveTool(evt.argCallID(), evt.Name); ta != nil && ta.args.Len() == 0 && evt.Args != "" {
-				ta.args.WriteString(evt.Args)
-			}
-		case "response.completed", "response.incomplete":
-			if evt.Response != nil && evt.Response.Usage != nil {
-				agg.usage = evt.Response.Usage
-			}
-		case "error", "response.failed":
-			if evt.Error != nil {
-				return nil, fmt.Errorf("codex upstream error (%s): %s", evt.Error.Code, evt.Error.Message)
-			}
-		}
+	agg, err := t.consume(src, nil)
+	for n := 0; errors.Is(err, ErrStalled) && n < maxReopens && t.Reopen != nil; n++ {
+		agg, err = t.reopenAndConsume(nil)
 	}
-	if err := sc.err(); err != nil {
+	if err != nil {
 		return nil, err
 	}
 
@@ -199,7 +149,7 @@ func (t *Translator) Collect(src io.Reader) ([]byte, error) {
 	}
 
 	resp := openAIResponse{
-		ID: strings.Replace(t.id, "chatcmpl-", "chatcmpl-", 1), Object: "chat.completion",
+		ID: t.id, Object: "chat.completion",
 		Created: t.created, Model: t.model,
 		Choices: []responseChoice{{Index: 0, Message: msg, FinishReason: finish}},
 		Usage:   toOpenAIUsage(agg.usage),
@@ -207,7 +157,71 @@ func (t *Translator) Collect(src io.Reader) ([]byte, error) {
 	return json.Marshal(resp)
 }
 
-// ── aggregate helpers ────────────────────────────────────────────
+func (t *Translator) reopenAndConsume(emit func(openAIChunk)) (*aggregate, error) {
+	src, err := t.Reopen()
+	if err != nil {
+		return newAggregate(), err
+	}
+	defer src.Close()
+	return t.consume(src, emit)
+}
+
+// consume parses one upstream attempt. With emit set (streaming) each content
+// and tool chunk goes out as it arrives; without it the text is accumulated
+// for Collect.
+func (t *Translator) consume(src io.Reader, emit func(openAIChunk)) (*aggregate, error) {
+	agg := newAggregate()
+	out := func(c openAIChunk) {
+		agg.emitted = true
+		if emit != nil {
+			emit(c)
+		}
+	}
+	sc := newSSEScanner(src)
+	for sc.next() {
+		evt, ok := sc.event()
+		if !ok {
+			continue
+		}
+		switch evt.Type {
+		case "response.output_text.delta":
+			if evt.Delta != "" {
+				if emit == nil {
+					agg.content.WriteString(evt.Delta)
+				}
+				out(t.contentChunk(evt.Delta))
+			}
+		case "response.output_item.added":
+			if evt.Item != nil && evt.Item.Type == "function_call" && evt.Item.CallID != "" {
+				ta := agg.startTool(evt.Item.CallID, evt.Item.Name)
+				agg.itemIDToCall[evt.Item.ID] = ta
+				out(t.toolStartChunk(ta))
+			}
+		case "response.function_call_arguments.delta":
+			ta := agg.resolveTool(evt.argCallID(), "")
+			if ta != nil && evt.Delta != "" {
+				ta.args.WriteString(evt.Delta)
+				out(t.toolArgsChunk(ta, evt.Delta))
+			}
+		case "response.function_call_arguments.done":
+			// Parallel calls can arrive with no deltas, arguments only here.
+			ta := agg.resolveTool(evt.argCallID(), evt.Name)
+			if ta != nil && ta.args.Len() == 0 && evt.Args != "" {
+				ta.args.WriteString(evt.Args)
+				out(t.toolArgsChunk(ta, evt.Args))
+			}
+		case "response.completed", "response.incomplete":
+			if evt.Response != nil && evt.Response.Usage != nil {
+				agg.usage = evt.Response.Usage
+			}
+		case "error", "response.failed":
+			if evt.Error != nil {
+				return agg, fmt.Errorf("codex upstream error (%s): %s", evt.Error.Code, evt.Error.Message)
+			}
+		}
+	}
+	return agg, sc.err()
+}
 
 func (a *aggregate) startTool(callID, name string) *toolAccum {
 	if ta, ok := a.byCallID[callID]; ok {
